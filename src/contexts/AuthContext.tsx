@@ -1,6 +1,9 @@
 import React, {createContext, useCallback, useContext, useEffect, useRef, useState} from 'react';
 import {
+  browserPopupRedirectResolver,
+  inMemoryPersistence,
   onAuthStateChanged,
+  setPersistence,
   signInWithPopup,
   signOut,
   type User,
@@ -493,17 +496,64 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
     setAuthError(null);
     pendingDraftRef.current = draft || null;
     try {
-      await signInWithPopup(auth, googleProvider);
+      await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
       return true;
     } catch (err: unknown) {
+      let finalErr = err;
+      const initialCode = (err as {code?: string})?.code || '';
+
+      // If browser storage partitioning or iframe restrictions caused an internal/storage error, retry with in-memory persistence
+      if (
+        initialCode === 'auth/internal-error' ||
+        initialCode === 'auth/web-storage-unsupported' ||
+        initialCode === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        try {
+          await setPersistence(auth, inMemoryPersistence);
+          await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
+          return true;
+        } catch (retryErr: unknown) {
+          finalErr = retryErr;
+        }
+      }
+
       pendingDraftRef.current = null;
-      const code = (err as {code?: string})?.code || '';
+      const code = (finalErr as {code?: string})?.code || '';
+      console.error('Google Sign-In error:', code, finalErr);
+
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
         setAuthError('Login cancelado. Clique novamente para entrar com sua conta Google.');
       } else if (code === 'auth/popup-blocked') {
-        setAuthError('O navegador bloqueou o popup de login. Permita popups e tente novamente.');
+        setAuthError(
+          'O navegador bloqueou a janela do Google. Permita popups para este site e tente novamente.',
+        );
+      } else if (code === 'auth/unauthorized-domain') {
+        const host = typeof window !== 'undefined' ? window.location.hostname : 'este domínio';
+        setAuthError(
+          `Domínio não autorizado no Firebase Auth (${host}). Abra o app pelo endereço oficial ou autorize este domínio no console Firebase.`,
+        );
+      } else if (code === 'auth/network-request-failed') {
+        setAuthError(
+          'Falha de conexão com o Google. Verifique sua internet ou desative bloqueadores para este site e tente novamente.',
+        );
+      } else if (code === 'auth/operation-not-allowed') {
+        setAuthError(
+          'O provedor Google não está habilitado no Firebase Auth. Ative o login com Google nas configurações de autenticação.',
+        );
+      } else if (
+        code === 'auth/internal-error' ||
+        code === 'auth/web-storage-unsupported' ||
+        code === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        setAuthError(
+          'O navegador bloqueou cookies/armazenamento da janela do Google. Abra o app em uma aba própria fora do modo anônimo ou permita cookies de terceiros para entrar.',
+        );
       } else {
-        setAuthError('Não foi possível concluir o login agora. Tente novamente.');
+        setAuthError(
+          code
+            ? `Não foi possível concluir o login agora (${code}). Tente abrir o site em uma nova aba e entrar novamente.`
+            : 'Não foi possível concluir o login agora. Tente novamente.',
+        );
       }
       return false;
     } finally {

@@ -1,4 +1,4 @@
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useMemo, useState} from 'react';
 import {Package} from 'lucide-react';
 
 interface ProductImageProps {
@@ -7,35 +7,50 @@ interface ProductImageProps {
   className?: string;
 }
 
-function getFallbackImageUrl(currentUrl: string): string | null {
-  if (/^https:\/\/i\.promobit\.com\.br\/(520|300)\//i.test(currentUrl)) {
-    return currentUrl.replace(/^https:\/\/i\.promobit\.com\.br\/(520|300)\//i, 'https://i.promobit.com.br/268/');
+function buildImageCandidateChain(rawSrc?: string): string[] {
+  const trimmed = (rawSrc || '').trim();
+  if (!trimmed) return [];
+
+  // Local bundled/public asset paths
+  if (trimmed.startsWith('/')) {
+    return [trimmed];
   }
-  if (/^https:\/\/i\.promobit\.com\.br\/268\//i.test(currentUrl)) {
-    return currentUrl.replace(/^https:\/\/i\.promobit\.com\.br\/268\//i, 'https://i.promobit.com.br/');
+
+  // Upgrade insecure http:// image URLs to https:// to avoid mixed-content blocking
+  const httpsUrl = trimmed.replace(/^http:\/\//i, 'https://');
+  if (!httpsUrl.startsWith('https://')) return [];
+
+  const proxyOf = (url: string) => `/api/image-proxy?url=${encodeURIComponent(url)}`;
+  const candidates: string[] = [];
+
+  if (/^https:\/\/i\.promobit\.com\.br\//i.test(httpsUrl)) {
+    // Promobit CDN sits behind GoCache which can block direct browser requests; try direct then proxy & size variants
+    const url300 = httpsUrl.replace(/^https:\/\/i\.promobit\.com\.br\/(520|268)\//i, 'https://i.promobit.com.br/300/');
+    const url268 = url300.replace(/^https:\/\/i\.promobit\.com\.br\/300\//i, 'https://i.promobit.com.br/268/');
+    const urlOrig = url268.replace(/^https:\/\/i\.promobit\.com\.br\/268\//i, 'https://i.promobit.com.br/');
+    candidates.push(url300, proxyOf(url300), proxyOf(url268), proxyOf(urlOrig));
+  } else {
+    candidates.push(httpsUrl, proxyOf(httpsUrl));
   }
-  return null;
+
+  return Array.from(new Set(candidates));
 }
 
 export const ProductImage: React.FC<ProductImageProps> = ({src, alt, className = ''}) => {
-  const [currentSrc, setCurrentSrc] = useState(src || '');
-  const [failed, setFailed] = useState(false);
+  const candidates = useMemo(() => buildImageCandidateChain(src), [src]);
+  const [attemptIndex, setAttemptIndex] = useState(0);
 
   useEffect(() => {
-    setCurrentSrc(src || '');
-    setFailed(false);
+    setAttemptIndex(0);
   }, [src]);
 
+  const currentSrc = candidates[attemptIndex] || '';
+
   const handleImageError = () => {
-    const fallback = getFallbackImageUrl(currentSrc);
-    if (fallback && fallback !== currentSrc) {
-      setCurrentSrc(fallback);
-      return;
-    }
-    setFailed(true);
+    setAttemptIndex((prev) => prev + 1);
   };
 
-  if (!currentSrc || failed) {
+  if (!currentSrc) {
     return (
       <div
         className={`flex flex-col items-center justify-center bg-slate-100 dark:bg-slate-800/80 text-slate-400 dark:text-slate-500 ${className}`}
@@ -50,6 +65,7 @@ export const ProductImage: React.FC<ProductImageProps> = ({src, alt, className =
     <img
       src={currentSrc}
       alt={alt}
+      loading="lazy"
       referrerPolicy="no-referrer"
       onError={handleImageError}
       onLoad={(e) => {

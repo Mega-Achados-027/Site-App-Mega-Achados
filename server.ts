@@ -744,6 +744,122 @@ function buildVerifiedStoreCoupons(stores: StoreConfig[], nowMs: number): StoreC
   return result;
 }
 
+const PRODUCT_FINGERPRINT_STOPWORDS = new Set([
+  'com',
+  'para',
+  'de',
+  'da',
+  'do',
+  'das',
+  'dos',
+  'em',
+  'no',
+  'na',
+  'nos',
+  'nas',
+  'por',
+  'ate',
+  'sem',
+  'juros',
+  'frete',
+  'gratis',
+  'cupom',
+  'oferta',
+  'promocao',
+  'pix',
+  'preto',
+  'preta',
+  'branco',
+  'branca',
+  'azul',
+  'prata',
+  'cinza',
+  'rosa',
+  'verde',
+  'vermelho',
+  'bivolt',
+  '110v',
+  '127v',
+  '220v',
+  'novo',
+  'nova',
+  'original',
+]);
+
+function normalizeProductFingerprint(title: string): string {
+  const tokens = title
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length >= 2 && !PRODUCT_FINGERPRINT_STOPWORDS.has(t));
+  if (tokens.length === 0) return '';
+  return tokens.slice(0, 6).join('-');
+}
+
+function extractBalancedJson(source: string, startIndex = 0, expectedOpen?: '{' | '['): string | null {
+  let idx = startIndex;
+  while (idx < source.length) {
+    const ch = source[idx];
+    if (expectedOpen) {
+      if (ch === expectedOpen) break;
+    } else if (ch === '{' || ch === '[') {
+      break;
+    }
+    idx++;
+  }
+  if (idx >= source.length) return null;
+
+  const openChar = source[idx];
+  const closeChar = openChar === '{' ? '}' : ']';
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = idx; i < source.length; i++) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === openChar) {
+      depth++;
+    } else if (ch === closeChar) {
+      depth--;
+      if (depth === 0) {
+        return source.slice(idx, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function parseFirstBalancedJsonObject<T>(rawText: string): T | null {
+  let cursor = 0;
+  while (cursor < rawText.length) {
+    const bracePos = rawText.indexOf('{', cursor);
+    if (bracePos === -1) return null;
+    const candidate = extractBalancedJson(rawText, bracePos, '{');
+    if (!candidate) return null;
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      cursor = bracePos + 1;
+    }
+  }
+  return null;
+}
+
 function loadState(): AppStateSnapshot {
   try {
     if (fs.existsSync(DB_FILE)) {
@@ -1198,60 +1314,6 @@ function pruneExpiredAndInvalidDeals(shouldBroadcast = false): boolean {
   }
 
   return false;
-}
-
-const PRODUCT_FINGERPRINT_STOPWORDS = new Set([
-  'com',
-  'para',
-  'de',
-  'da',
-  'do',
-  'das',
-  'dos',
-  'em',
-  'no',
-  'na',
-  'nos',
-  'nas',
-  'por',
-  'ate',
-  'sem',
-  'juros',
-  'frete',
-  'gratis',
-  'cupom',
-  'oferta',
-  'promocao',
-  'pix',
-  'preto',
-  'preta',
-  'branco',
-  'branca',
-  'azul',
-  'prata',
-  'cinza',
-  'rosa',
-  'verde',
-  'vermelho',
-  'bivolt',
-  '110v',
-  '127v',
-  '220v',
-  'novo',
-  'nova',
-  'original',
-]);
-
-function normalizeProductFingerprint(title: string): string {
-  const tokens = title
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter((t) => t.length >= 2 && !PRODUCT_FINGERPRINT_STOPWORDS.has(t));
-  if (tokens.length === 0) return '';
-  return tokens.slice(0, 6).join('-');
 }
 
 function getPublishedHistorySet(): Set<string> {
@@ -2529,33 +2591,150 @@ function scoreTitleMatch(queryTokens: string[], title: string): number {
   return hits / queryTokens.length;
 }
 
-async function fetchBuscapeCrossStoreOffers(
+function isSafePublicRetailHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (
+    !host ||
+    host === 'localhost' ||
+    host === '0.0.0.0' ||
+    host === '::1' ||
+    host.endsWith('.local') ||
+    host.startsWith('127.') ||
+    host.startsWith('10.') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function canonicalizeDirectStoreProductUrl(rawTargetUrl: string, store: StoreConfig): string | null {
+  try {
+    const parsed = new URL(rawTargetUrl);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    if (!isSafePublicRetailHost(parsed.hostname)) return null;
+
+    // Unwrap affiliate/tracking redirect wrappers (Awin, Lomadee, Rakuten, etc.) if present
+    for (const key of ['ued', 'murl', 'url', 'redirect', 'u']) {
+      const embedded = parsed.searchParams.get(key);
+      if (embedded && /^https?:\/\//i.test(embedded)) {
+        const unwrapped = canonicalizeDirectStoreProductUrl(embedded, store);
+        if (unwrapped) return unwrapped;
+      }
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    const storeDom = store.domain.toLowerCase().replace(/^www\./, '');
+    const storeMatches =
+      host.includes(storeDom) ||
+      (storeDom.includes('magazineluiza') && host.includes('magalu')) ||
+      (storeDom.includes('mercadolivre') && host.includes('mercadolibre'));
+    if (!storeMatches) return null;
+
+    // Canonicalize Amazon product URLs straight to /dp/{ASIN} so it NEVER opens a search field
+    if (host.includes('amazon.')) {
+      const asinMatch = parsed.pathname.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i);
+      if (asinMatch) {
+        return `https://www.amazon.com.br/dp/${asinMatch[1].toUpperCase()}`;
+      }
+      // Reject Amazon search URLs from redirect resolution
+      if (parsed.pathname === '/s' || parsed.pathname.startsWith('/s/')) return null;
+    }
+
+    // Strip third-party aggregator / Zoom / Buscapé tracking parameters so our own affiliate tag applies cleanly
+    const cleanUrl = new URL(`https://${parsed.hostname}${parsed.pathname}`);
+    const keepParams = new Set(['sku', 'skuId', 'item_id', 'variation', 'model']);
+    parsed.searchParams.forEach((val, key) => {
+      if (keepParams.has(key)) {
+        cleanUrl.searchParams.set(key, val);
+      }
+    });
+    const finalStr = cleanUrl.toString();
+    if (isFakeProductUrl(finalStr)) return null;
+    return finalStr;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveDirectStoreUrlFromComparatorOffer(
+  baseHost: 'www.buscape.com.br' | 'www.zoom.com.br',
+  offerId: string,
+  store: StoreConfig,
+): Promise<string | null> {
+  const cleanOid = String(offerId || '').trim();
+  if (!/^\d{4,16}$/.test(cleanOid)) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    let currentUrl = `https://${baseHost}/lead?oid=${cleanOid}&channel=1&index=0&redirect=auto&logAndRedirect=1`;
+    for (let hop = 0; hop < 4; hop++) {
+      const parsedCur = new URL(currentUrl);
+      if (!['https:', 'http:'].includes(parsedCur.protocol) || !isSafePublicRetailHost(parsedCur.hostname)) {
+        return null;
+      }
+      const resp = await fetch(currentUrl, {
+        redirect: 'manual',
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          Referer: `https://${baseHost}/`,
+          'Accept-Language': 'pt-BR,pt;q=0.9',
+        },
+        signal: controller.signal,
+      });
+      const loc = resp.headers.get('location');
+      if (!loc) return null;
+
+      const nextUrl = loc.startsWith('http') ? loc : new URL(loc, currentUrl).toString();
+      const canonical = canonicalizeDirectStoreProductUrl(nextUrl, store);
+      if (canonical) return canonical;
+
+      currentUrl = nextUrl;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface ComparatorPendingOffer {
+  store: StoreConfig;
+  offerId?: string;
+  baseHost: 'www.buscape.com.br' | 'www.zoom.com.br';
+  candidate: StoreLivePriceCandidate;
+}
+
+async function fetchComparatorCrossStoreOffers(
+  baseHost: 'www.buscape.com.br' | 'www.zoom.com.br',
   query: string,
   activeStores: StoreConfig[],
-): Promise<{
-  byStoreId: Map<string, StoreLivePriceCandidate>;
-  bestImageUrl?: string;
-}> {
-  const byStoreId = new Map<string, StoreLivePriceCandidate>();
+  pendingByStore: Map<string, ComparatorPendingOffer>,
+): Promise<string | undefined> {
   let bestImageUrl: string | undefined;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 7000);
 
   try {
-    const searchUrl = `https://www.buscape.com.br/search?q=${encodeURIComponent(query)}`;
+    const searchUrl = `https://${baseHost}/search?q=${encodeURIComponent(query)}`;
     const resp = await fetch(searchUrl, {
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept-Language': 'pt-BR,pt;q=0.9',
       },
       signal: controller.signal,
     });
-    if (!resp.ok) return {byStoreId};
+    if (!resp.ok) return bestImageUrl;
 
     const html = await resp.text();
     const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-    if (!match) return {byStoreId};
+    if (!match) return bestImageUrl;
 
     const parsed = JSON.parse(match[1]) as {
       props?: {
@@ -2567,7 +2746,8 @@ async function fetchBuscapeCrossStoreOffers(
               price?: number;
               image?: string;
               url?: string;
-              bestOffer?: {merchantName?: string};
+              merchants?: Array<{id?: string; name?: string}>;
+              bestOffer?: {id?: string; merchantName?: string};
             }>;
           };
         };
@@ -2577,37 +2757,57 @@ async function fetchBuscapeCrossStoreOffers(
     const hits = parsed?.props?.initialReduxState?.hits?.hits || [];
     const qTokens = normalizeSearchTokens(query);
 
-    // Pick top 2 matching product pages on Buscapé to extract per-store real-time offer lists
-    const productHits = hits
-      .filter((h) => h.url && Number(h.price) > 0)
-      .sort((a, b) => scoreTitleMatch(qTokens, b.name || '') - scoreTitleMatch(qTokens, a.name || ''))
-      .slice(0, 2);
+    const scoredHits = hits
+      .filter((h) => h.url && Number(h.price) > 0 && !isUnwantedAccessoryTitle(query, String(h.name || '')))
+      .map((h) => {
+        const titleScore = scoreTitleMatch(qTokens, h.name || '');
+        const uniqueMerchants = new Set(
+          (h.merchants || []).map((m) => String(m.name || '').toLowerCase()).filter(Boolean),
+        ).size;
+        return {hit: h, titleScore, uniqueMerchants};
+      })
+      .filter((entry) => (qTokens.length >= 2 ? entry.titleScore >= 0.45 : entry.titleScore > 0))
+      .sort((a, b) => {
+        if (Math.abs(b.titleScore - a.titleScore) > 0.15) return b.titleScore - a.titleScore;
+        return b.uniqueMerchants - a.uniqueMerchants;
+      });
 
-    if (productHits[0]?.image) {
-      bestImageUrl = productHits[0].image;
+    const topForSeed = scoredHits.slice(0, 8).map((s) => s.hit);
+    const productHits = scoredHits.slice(0, 4).map((s) => s.hit);
+
+    if (topForSeed[0]?.image) {
+      bestImageUrl = topForSeed[0].image;
     }
 
-    // Seed bestOffer from top hit immediately in case product page omits it
-    for (const h of productHits) {
+    // Seed bestOffer across top matching hits so stores appearing on closely matching variants are never missed
+    for (const h of topForSeed) {
       const merchant = h.bestOffer?.merchantName;
       if (!merchant || !h.price) continue;
       const store = matchConfiguredStore(activeStores, undefined, merchant);
       if (!store) continue;
-      const existing = byStoreId.get(store.id);
-      if (!existing || h.price < existing.price) {
+      const cleanPrice = Math.round(Number(h.price) * 100) / 100;
+      const existing = pendingByStore.get(store.id);
+      if (!existing || cleanPrice < existing.candidate.price) {
         const title = String(h.name || query).trim();
-        byStoreId.set(store.id, {
-          storeId: store.id,
-          productTitle: title.slice(0, 120),
-          imageUrl: h.image || bestImageUrl,
-          price: Math.round(Number(h.price) * 100) / 100,
-          rawUrl: buildValidStoreSearchUrl(store, cleanProductTitleForStoreSearch(title)),
-          sourceLabel: 'Preço ao vivo',
+        pendingByStore.set(store.id, {
+          store,
+          offerId: h.bestOffer?.id ? String(h.bestOffer.id) : undefined,
+          baseHost,
+          candidate: {
+            storeId: store.id,
+            productTitle: title.slice(0, 120),
+            imageUrl: h.image || bestImageUrl,
+            price: cleanPrice,
+            installments: `${store.installmentsInfo} de R$ ${(cleanPrice / 10).toFixed(2).replace('.', ',')}`,
+            shipping: store.defaultShipping,
+            rawUrl: buildValidStoreSearchUrl(store, cleanProductTitleForStoreSearch(title)),
+            sourceLabel: 'Preço ao vivo',
+          },
         });
       }
     }
 
-    // Fetch up to 2 matched Buscapé product comparison pages in parallel for all per-store offers
+    // Fetch up to 4 matched product comparison pages in parallel for all per-store offers
     await Promise.all(
       productHits.map(async (hit) => {
         if (!hit.url) return;
@@ -2616,11 +2816,11 @@ async function fetchBuscapeCrossStoreOffers(
         try {
           const prodUrl = hit.url.startsWith('http')
             ? hit.url
-            : `https://www.buscape.com.br${hit.url.startsWith('/') ? hit.url : `/${hit.url}`}`;
+            : `https://${baseHost}${hit.url.startsWith('/') ? hit.url : `/${hit.url}`}`;
           const pr = await fetch(prodUrl, {
             headers: {
               'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
               'Accept-Language': 'pt-BR,pt;q=0.9',
             },
             signal: pageCtrl.signal,
@@ -2636,6 +2836,7 @@ async function fetchBuscapeCrossStoreOffers(
               initialReduxState?: {
                 offers?: {
                   offerList?: Array<{
+                    id?: string | number;
                     name?: string;
                     price?: number;
                     sellerName?: string;
@@ -2644,6 +2845,7 @@ async function fetchBuscapeCrossStoreOffers(
                     parcelValue?: number;
                   }>;
                   displayOffers?: Array<{
+                    id?: string | number;
                     name?: string;
                     price?: number;
                     sellerName?: string;
@@ -2666,8 +2868,11 @@ async function fetchBuscapeCrossStoreOffers(
             const store = matchConfiguredStore(activeStores, undefined, offer.sellerName);
             if (!store) continue;
             const cleanPrice = Math.round(price * 100) / 100;
-            const existing = byStoreId.get(store.id);
-            if (existing && existing.price <= cleanPrice) continue;
+            const existing = pendingByStore.get(store.id);
+            const offerIdStr = offer.id ? String(offer.id) : undefined;
+            if (existing && existing.candidate.price <= cleanPrice && (existing.offerId || !offerIdStr)) {
+              continue;
+            }
 
             const title = String(offer.name || hit.name || query).trim();
             const img = offer.imageUrl || hit.image || bestImageUrl;
@@ -2680,15 +2885,20 @@ async function fetchBuscapeCrossStoreOffers(
                 ? `${parcels}x de R$ ${parcelVal.toFixed(2).replace('.', ',')}`
                 : `${store.installmentsInfo} de R$ ${(cleanPrice / 10).toFixed(2).replace('.', ',')}`;
 
-            byStoreId.set(store.id, {
-              storeId: store.id,
-              productTitle: title.slice(0, 120),
-              imageUrl: img,
-              price: cleanPrice,
-              installments,
-              shipping: store.defaultShipping,
-              rawUrl: buildValidStoreSearchUrl(store, cleanProductTitleForStoreSearch(title)),
-              sourceLabel: 'Preço ao vivo',
+            pendingByStore.set(store.id, {
+              store,
+              offerId: offerIdStr,
+              baseHost,
+              candidate: {
+                storeId: store.id,
+                productTitle: title.slice(0, 120),
+                imageUrl: img,
+                price: cleanPrice,
+                installments,
+                shipping: store.defaultShipping,
+                rawUrl: buildValidStoreSearchUrl(store, cleanProductTitleForStoreSearch(title)),
+                sourceLabel: 'Preço ao vivo',
+              },
             });
           }
         } catch {
@@ -2699,12 +2909,63 @@ async function fetchBuscapeCrossStoreOffers(
       }),
     );
 
-    return {byStoreId, bestImageUrl};
+    return bestImageUrl;
   } catch {
-    return {byStoreId, bestImageUrl};
+    return bestImageUrl;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchBuscapeCrossStoreOffers(
+  query: string,
+  activeStores: StoreConfig[],
+): Promise<{
+  byStoreId: Map<string, StoreLivePriceCandidate>;
+  bestImageUrl?: string;
+}> {
+  const pendingByStore = new Map<string, ComparatorPendingOffer>();
+
+  let bestImageUrl = await fetchComparatorCrossStoreOffers(
+    'www.buscape.com.br',
+    query,
+    activeStores,
+    pendingByStore,
+  );
+
+  // If Buscapé returned fewer than 3 configured stores, also query Zoom for broader multi-store coverage
+  if (pendingByStore.size < 3) {
+    const zoomImg = await fetchComparatorCrossStoreOffers(
+      'www.zoom.com.br',
+      query,
+      activeStores,
+      pendingByStore,
+    );
+    if (!bestImageUrl && zoomImg) bestImageUrl = zoomImg;
+  }
+
+  // Unwrap REAL direct product URLs (e.g. amazon.com.br/dp/ASIN, magazineluiza.com.br/.../p/..., mercadolivre...) in parallel!
+  const entries = Array.from(pendingByStore.values());
+  await Promise.all(
+    entries.map(async (entry) => {
+      if (!entry.offerId) return;
+      const directUrl = await resolveDirectStoreUrlFromComparatorOffer(
+        entry.baseHost,
+        entry.offerId,
+        entry.store,
+      );
+      if (directUrl) {
+        entry.candidate.rawUrl = directUrl;
+        entry.candidate.sourceLabel = `Direto ${entry.store.name}`;
+      }
+    }),
+  );
+
+  const byStoreId = new Map<string, StoreLivePriceCandidate>();
+  for (const [storeId, entry] of pendingByStore.entries()) {
+    byStoreId.set(storeId, entry.candidate);
+  }
+  return {byStoreId, bestImageUrl};
 }
 
 const ACCESSORY_WORDS_REGEX =
@@ -3170,18 +3431,17 @@ async function searchProductAcrossConfiguredStores(
       });
 
       const rawText = response.text || '';
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]) as {
-          offers?: Array<{
-            storeDomain?: string;
-            productTitle?: string;
-            price?: number;
-            couponCode?: string;
-            couponDiscount?: string;
-            productUrl?: string;
-          }>;
-        };
+      const parsed = parseFirstBalancedJsonObject<{
+        offers?: Array<{
+          storeDomain?: string;
+          productTitle?: string;
+          price?: number;
+          couponCode?: string;
+          couponDiscount?: string;
+          productUrl?: string;
+        }>;
+      }>(rawText);
+      if (parsed) {
         for (const item of parsed.offers || []) {
           const price = Number(item.price || 0);
           if (!Number.isFinite(price) || price <= 5) continue;
@@ -3531,21 +3791,19 @@ async function refreshStoreCoupons(): Promise<{
         });
 
         const rawText = response.text || '';
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]) as {
-            coupons?: Array<{
-              storeDomain?: string;
-              code?: string;
-              title?: string;
-              description?: string;
-              discountLabel?: string;
-              minPurchaseLabel?: string;
-              category?: string;
-              sourceUrl?: string;
-            }>;
-          };
-
+        const parsed = parseFirstBalancedJsonObject<{
+          coupons?: Array<{
+            storeDomain?: string;
+            code?: string;
+            title?: string;
+            description?: string;
+            discountLabel?: string;
+            minPurchaseLabel?: string;
+            category?: string;
+            sourceUrl?: string;
+          }>;
+        }>(rawText);
+        if (parsed) {
           const seenKeys = new Set<string>(finalCoupons.map((c) => `${c.storeId}:${c.code}`));
           for (const item of parsed.coupons || []) {
             const code = String(item.code || '')
@@ -3986,6 +4244,125 @@ async function startServer() {
   app.use(express.json({limit: '2mb'}));
 
   // --- API Routes ---
+
+  const ALLOWED_IMAGE_PROXY_HOSTS = new Set([
+    'i.promobit.com.br',
+    'image.zst.com.br',
+    'i.zst.com.br',
+    's.zst.com.br',
+    'images.kabum.com.br',
+    'images0.kabum.com.br',
+    'images1.kabum.com.br',
+    'images2.kabum.com.br',
+    'images3.kabum.com.br',
+    'images4.kabum.com.br',
+    'images5.kabum.com.br',
+    'images6.kabum.com.br',
+    'images7.kabum.com.br',
+    'images8.kabum.com.br',
+    'images9.kabum.com.br',
+    'm.media-amazon.com',
+    'images-na.ssl-images-amazon.com',
+    'http2.mlstatic.com',
+    'a-static.mlcdn.com.br',
+    'cf.shopee.com.br',
+    'down-br.img.susercontent.com',
+    'imgs.casasbahia.com.br',
+    'imgs.extra.com.br',
+    'imgs.pontofrio.com.br',
+    'ae01.alicdn.com',
+    'static.netshoes.com.br',
+    'imgcentauro-a.akamaihd.net',
+    'images.tcdn.com.br',
+    'lh3.googleusercontent.com',
+  ]);
+
+  const isAllowedImageProxyUrl = (rawUrl: string): URL | null => {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+      const host = parsed.hostname.toLowerCase();
+      if (!isSafePublicRetailHost(host)) return null;
+      if (!ALLOWED_IMAGE_PROXY_HOSTS.has(host)) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+
+  app.get('/api/image-proxy', async (req, res) => {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    const parsedUrl = isAllowedImageProxyUrl(rawUrl);
+    if (!parsedUrl) {
+      res.status(400).send('Invalid or unsupported image host');
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7000);
+    try {
+      let currentUrl = parsedUrl.toString();
+      let upstream: globalThis.Response | null = null;
+
+      for (let hop = 0; hop < 3; hop++) {
+        const resp = await fetch(currentUrl, {
+          redirect: 'manual',
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            Accept: 'image/avif,image/webp,image/apng,image/png,image/jpeg,image/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9',
+          },
+          signal: controller.signal,
+        });
+
+        if (resp.status >= 300 && resp.status < 400) {
+          const loc = resp.headers.get('location');
+          if (!loc) {
+            res.status(502).send('Redirect missing location');
+            return;
+          }
+          const resolved = loc.startsWith('http') ? loc : new URL(loc, currentUrl).toString();
+          const checked = isAllowedImageProxyUrl(resolved);
+          if (!checked) {
+            res.status(403).send('Redirect host not allowed');
+            return;
+          }
+          currentUrl = checked.toString();
+          continue;
+        }
+
+        upstream = resp;
+        break;
+      }
+
+      if (!upstream || !upstream.ok) {
+        res.status(upstream?.status || 502).send('Image unavailable');
+        return;
+      }
+
+      const contentType = (upstream.headers.get('content-type') || '').toLowerCase().split(';')[0].trim();
+      if (!contentType.startsWith('image/') || contentType === 'image/svg+xml') {
+        res.status(415).send('Unsupported content type');
+        return;
+      }
+
+      const arrayBuf = await upstream.arrayBuffer();
+      if (arrayBuf.byteLength === 0 || arrayBuf.byteLength > 5 * 1024 * 1024) {
+        res.status(413).send('Invalid image payload size');
+        return;
+      }
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(Buffer.from(arrayBuf));
+    } catch {
+      res.status(504).send('Image fetch timeout');
+    } finally {
+      clearTimeout(timer);
+    }
+  });
 
   app.get('/api/state', (_req, res) => {
     pruneExpiredAndInvalidDeals(false);
@@ -5170,14 +5547,61 @@ async function startServer() {
       }
 
       const html = await resp.text();
-      const match = /AF_initDataCallback\(\{key:\s*'ds:1'[\s\S]*?data:([\s\S]*?),\s*sideChannel:/.exec(
-        html,
-      );
-      if (!match) {
+      const extractGoogleFlightsPayload = (sourceHtml: string): unknown[] | null => {
+        const candidates: Array<{key: string; data: unknown[]}> = [];
+        const cbRegex = /AF_initDataCallback\(\{key:\s*'([^']+)'/g;
+        let m: RegExpExecArray | null;
+        while ((m = cbRegex.exec(sourceHtml)) !== null) {
+          const key = m[1];
+          const searchWindowEnd = Math.min(sourceHtml.length, m.index + 400);
+          const dataIdx = sourceHtml.indexOf('data:', m.index);
+          if (dataIdx === -1 || dataIdx > searchWindowEnd) continue;
+
+          // Locate the start of the JSON array after "data:" (or "data:function(){return ")
+          let arrStart = dataIdx + 5;
+          while (arrStart < sourceHtml.length && /\s/.test(sourceHtml[arrStart])) arrStart++;
+          if (sourceHtml.startsWith('function', arrStart)) {
+            const retIdx = sourceHtml.indexOf('return', arrStart);
+            if (retIdx === -1 || retIdx > arrStart + 80) continue;
+            arrStart = retIdx + 6;
+            while (arrStart < sourceHtml.length && /\s/.test(sourceHtml[arrStart])) arrStart++;
+          }
+          if (sourceHtml[arrStart] !== '[') continue;
+
+          const jsonSlice = extractBalancedJson(sourceHtml, arrStart, '[');
+          if (!jsonSlice) continue;
+
+          try {
+            const parsedArr = JSON.parse(jsonSlice) as unknown[];
+            if (Array.isArray(parsedArr)) {
+              candidates.push({key, data: parsedArr});
+            }
+          } catch {
+            // Skip malformed callback block safely
+          }
+        }
+
+        const hasFlightOffers = (arr: unknown[]): boolean => {
+          const b = Array.isArray((arr[2] as unknown[])?.[0]) ? ((arr[2] as unknown[])[0] as unknown[]) : [];
+          const o = Array.isArray((arr[3] as unknown[])?.[0]) ? ((arr[3] as unknown[])[0] as unknown[]) : [];
+          return b.length > 0 || o.length > 0;
+        };
+
+        const ds1WithOffers = candidates.find((c) => c.key === 'ds:1' && hasFlightOffers(c.data));
+        if (ds1WithOffers) return ds1WithOffers.data;
+
+        const anyWithOffers = candidates.find((c) => hasFlightOffers(c.data));
+        if (anyWithOffers) return anyWithOffers.data;
+
+        const ds1Fallback = candidates.find((c) => c.key === 'ds:1');
+        return ds1Fallback ? ds1Fallback.data : null;
+      };
+
+      const data = extractGoogleFlightsPayload(html);
+      if (!data) {
         throw new Error('Não foi possível extrair os dados de tarifas ao vivo para esta consulta.');
       }
 
-      const data = JSON.parse(match[1]) as unknown[];
       const bestArr = Array.isArray((data[2] as unknown[])?.[0]) ? ((data[2] as unknown[])[0] as unknown[]) : [];
       const otherArr = Array.isArray((data[3] as unknown[])?.[0]) ? ((data[3] as unknown[])[0] as unknown[]) : [];
       const rawItems = [...bestArr, ...otherArr];
@@ -5812,28 +6236,20 @@ async function startServer() {
       }
 
       const rawText = (response.text || '').trim();
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      let parsed: {
-        summary?: string;
-        fares?: Array<{
-          airlineCode?: string;
-          airlineName?: string;
-          totalBrl?: number;
-          stops?: number;
-          stopLabel?: string;
-          flightNumber?: string;
-          officialUrl?: string;
-          sourceName?: string;
-        }>;
-      } = {};
-
-      if (jsonMatch) {
-        try {
-          parsed = JSON.parse(jsonMatch[0]);
-        } catch {
-          parsed = {};
-        }
-      }
+      const parsed =
+        parseFirstBalancedJsonObject<{
+          summary?: string;
+          fares?: Array<{
+            airlineCode?: string;
+            airlineName?: string;
+            totalBrl?: number;
+            stops?: number;
+            stopLabel?: string;
+            flightNumber?: string;
+            officialUrl?: string;
+            sourceName?: string;
+          }>;
+        }>(rawText) || {};
 
       res.json({
         summary:
