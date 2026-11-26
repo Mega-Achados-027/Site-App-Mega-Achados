@@ -9,15 +9,19 @@ export function usePWAInstall() {
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalled, setIsInstalled] = useState(false);
   const [isIOS, setIsIOS] = useState(false);
+  const [isAndroid, setIsAndroid] = useState(false);
 
   useEffect(() => {
+    const userAgent = window.navigator.userAgent.toLowerCase();
+    const isNativeAndroidApk = userAgent.includes('megaachados027app');
     const isStandalone =
+      isNativeAndroidApk ||
       window.matchMedia('(display-mode: standalone)').matches ||
       (window.navigator as unknown as {standalone?: boolean}).standalone === true;
     setIsInstalled(isStandalone);
 
-    const userAgent = window.navigator.userAgent.toLowerCase();
     setIsIOS(/iphone|ipad|ipod/.test(userAgent));
+    setIsAndroid(/android/.test(userAgent));
 
     const handleBeforeInstallPrompt = (e: Event) => {
       e.preventDefault();
@@ -54,6 +58,7 @@ export function usePWAInstall() {
     isInstallable: Boolean(deferredPrompt),
     isInstalled,
     isIOS,
+    isAndroid,
     install,
   };
 }

@@ -6,6 +6,7 @@ import http from 'http';
 import path from 'path';
 import {fileURLToPath} from 'url';
 import {WebSocketServer, WebSocket} from 'ws';
+import {buildSignedAndroidApkForUrl} from './server-utils/apkSigner.ts';
 import type {
   Airport,
   AlertNotification,
@@ -287,6 +288,275 @@ function isStoreSearchUrl(rawUrl: string): boolean {
   } catch {
     return true;
   }
+}
+
+const CANONICAL_DEAL_CATEGORIES = new Set<string>([
+  'Hardware',
+  'Smartphones',
+  'Áudio',
+  'TV & Casa',
+  'Eletroportáteis',
+  'Monitores',
+  'Notebooks',
+  'Periféricos',
+  'Tablets',
+  'Games',
+  'Wearables',
+  'Beleza & Saúde',
+  'Ferramentas',
+  'Esporte & Lazer',
+  'Eletrônicos',
+  'Ofertas',
+]);
+
+function mapRetailerCategory(rawCat: string, fallback = 'Eletrônicos'): string {
+  const safeFallback = CANONICAL_DEAL_CATEGORIES.has(fallback) ? fallback : 'Eletrônicos';
+  const trimmed = String(rawCat || '').trim();
+  if (CANONICAL_DEAL_CATEGORIES.has(trimmed)) {
+    return trimmed;
+  }
+
+  const lower = trimmed
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  // Check wearables before smartphones/accessories so "Smartwatch Samsung Galaxy Fit3" -> Wearables
+  if (
+    lower.includes('smartwatch') ||
+    lower.includes('smartband') ||
+    lower.includes('relogio inteligente') ||
+    lower.includes('galaxy fit') ||
+    lower.includes('galaxy watch') ||
+    lower.includes('apple watch') ||
+    lower.includes('amazfit') ||
+    lower.includes('mi band') ||
+    lower.includes('garmin') ||
+    /\bwatch\b/.test(lower)
+  ) {
+    return 'Wearables';
+  }
+
+  // Check tablets before smartphones so "Galaxy Tab S10 Lite" -> Tablets
+  if (
+    lower.includes('tablet') ||
+    lower.includes('ipad') ||
+    lower.includes('galaxy tab') ||
+    lower.includes('kindle') ||
+    lower.includes('e-reader')
+  ) {
+    return 'Tablets';
+  }
+
+  // Check games/consoles/controllers before peripherals so "Controle Sony Dualsense PS5" -> Games
+  if (
+    lower.includes('playstation') ||
+    /\bps[45]\b/.test(lower) ||
+    lower.includes('dualsense') ||
+    lower.includes('xbox') ||
+    lower.includes('nintendo') ||
+    lower.includes('switch') ||
+    lower.includes('joystick') ||
+    lower.includes('console') ||
+    lower.includes('controle sem fio') ||
+    /\bgames?\b/.test(lower)
+  ) {
+    return 'Games';
+  }
+
+  if (
+    lower.includes('celular') ||
+    lower.includes('smartphone') ||
+    lower.includes('iphone') ||
+    /\bgalaxy\s+[sazm]\d/.test(lower) ||
+    lower.includes('motorola') ||
+    lower.includes('moto g') ||
+    lower.includes('xiaomi') ||
+    lower.includes('redmi') ||
+    lower.includes('poco ') ||
+    lower.includes('realme')
+  ) {
+    return 'Smartphones';
+  }
+
+  if (
+    lower.includes('notebook') ||
+    lower.includes('laptop') ||
+    lower.includes('macbook') ||
+    lower.includes('ultrabook') ||
+    lower.includes('chromebook') ||
+    lower.includes('ideapad') ||
+    lower.includes('vivobook') ||
+    lower.includes('aspire') ||
+    lower.includes('inspiron')
+  ) {
+    return 'Notebooks';
+  }
+
+  if (lower.includes('monitor')) {
+    return 'Monitores';
+  }
+
+  if (
+    lower.includes('fone') ||
+    lower.includes('headset') ||
+    lower.includes('headphone') ||
+    lower.includes('earbud') ||
+    lower.includes('airpods') ||
+    lower.includes('buds') ||
+    lower.includes('soundcore') ||
+    lower.includes('soundbar') ||
+    lower.includes('caixa de som') ||
+    lower.includes('home theater') ||
+    lower.includes('speaker') ||
+    lower.includes('audio')
+  ) {
+    return 'Áudio';
+  }
+
+  if (
+    lower.includes('placa de video') ||
+    lower.includes('placa mae') ||
+    lower.includes('placa-mae') ||
+    /\brtx\b|\brx\s*\d{3,4}\b|\bgeforce\b|\bradeon\b/.test(lower) ||
+    lower.includes('ssd') ||
+    lower.includes('nvme') ||
+    lower.includes('hd externo') ||
+    lower.includes('hardware') ||
+    lower.includes('processador') ||
+    lower.includes('ryzen') ||
+    lower.includes('intel core') ||
+    lower.includes('memoria ram') ||
+    lower.includes('ddr4') ||
+    lower.includes('ddr5') ||
+    lower.includes('water cooler') ||
+    lower.includes('gabinete') ||
+    lower.includes('roteador')
+  ) {
+    return 'Hardware';
+  }
+
+  if (
+    lower.includes('teclado') ||
+    lower.includes('mouse') ||
+    lower.includes('webcam') ||
+    lower.includes('microfone') ||
+    lower.includes('cadeira gamer') ||
+    lower.includes('cadeira de escritorio') ||
+    lower.includes('impressora') ||
+    lower.includes('multifuncional') ||
+    lower.includes('ecotank') ||
+    lower.includes('perifer') ||
+    lower.includes('carregador') ||
+    lower.includes('power bank') ||
+    lower.includes('base de carregamento') ||
+    lower.includes('hub usb')
+  ) {
+    return 'Periféricos';
+  }
+
+  if (
+    lower.includes('smart tv') ||
+    /\btv\b/.test(lower) ||
+    lower.includes('televis') ||
+    lower.includes('projetor') ||
+    lower.includes('ar condicionado') ||
+    lower.includes('ar-condicionado') ||
+    lower.includes('climatizador') ||
+    lower.includes('colchao') ||
+    lower.includes('travesseiro') ||
+    lower.includes('casa') ||
+    lower.includes('jardim')
+  ) {
+    return 'TV & Casa';
+  }
+
+  if (
+    lower.includes('eletro') ||
+    lower.includes('cozinha') ||
+    lower.includes('cafe') ||
+    lower.includes('nespresso') ||
+    lower.includes('fryer') ||
+    lower.includes('fritadeira') ||
+    lower.includes('geladeira') ||
+    lower.includes('refrigerador') ||
+    lower.includes('lavadora') ||
+    lower.includes('maquina de lavar') ||
+    lower.includes('microondas') ||
+    lower.includes('micro-ondas') ||
+    lower.includes('fogao') ||
+    lower.includes('cooktop') ||
+    lower.includes('forno') ||
+    lower.includes('liquidificador') ||
+    lower.includes('batedeira') ||
+    lower.includes('mixer') ||
+    lower.includes('sanduicheira') ||
+    lower.includes('grill') ||
+    lower.includes('torradeira') ||
+    lower.includes('aspirador') ||
+    lower.includes('ventilador') ||
+    lower.includes('panela') ||
+    lower.includes('purificador') ||
+    lower.includes('ferro de passar')
+  ) {
+    return 'Eletroportáteis';
+  }
+
+  if (
+    lower.includes('furadeira') ||
+    lower.includes('parafusadeira') ||
+    lower.includes('esmerilhadeira') ||
+    lower.includes('serra') ||
+    lower.includes('ferramenta') ||
+    lower.includes('makita') ||
+    lower.includes('dewalt') ||
+    lower.includes('bosch')
+  ) {
+    return 'Ferramentas';
+  }
+
+  if (
+    lower.includes('perfume') ||
+    lower.includes('secador') ||
+    lower.includes('chapinha') ||
+    lower.includes('barbeador') ||
+    lower.includes('skincare') ||
+    lower.includes('shampoo') ||
+    lower.includes('whey') ||
+    lower.includes('creatina') ||
+    lower.includes('suplemento') ||
+    lower.includes('beleza') ||
+    lower.includes('saude')
+  ) {
+    return 'Beleza & Saúde';
+  }
+
+  if (
+    lower.includes('tenis') ||
+    lower.includes('bicicleta') ||
+    lower.includes('mochila') ||
+    lower.includes('mala') ||
+    lower.includes('academia') ||
+    lower.includes('camping') ||
+    lower.includes('esporte')
+  ) {
+    return 'Esporte & Lazer';
+  }
+
+  return safeFallback;
+}
+
+function normalizeDealCategory(
+  rawCategory: string | undefined,
+  productName?: string,
+  fallback = 'Eletrônicos',
+): string {
+  const cleanCat = String(rawCategory || '').trim();
+  if (CANONICAL_DEAL_CATEGORIES.has(cleanCat)) {
+    return cleanCat;
+  }
+  if (cleanCat.toLowerCase() === 'esporte') return 'Esporte & Lazer';
+  return mapRetailerCategory(`${cleanCat} ${productName || ''}`, fallback);
 }
 
 function decodeHtmlEntities(input: string): string {
@@ -978,9 +1248,10 @@ function loadState(): AppStateSnapshot {
         }));
         const storeById = new Map(stores.map((s) => [s.id, s]));
 
-        // Migrate any legacy synthetic /produto/<slug> URLs so zero 404 links ever survive
+        // Migrate any legacy synthetic /produto/<slug> URLs and sanitize categories
         const products = parsed.products.map((prod) => ({
           ...prod,
+          category: normalizeDealCategory(prod.category, prod.name),
           offers: (prod.offers || []).map((offer) => {
             const store = storeById.get(offer.storeId);
             if (store && isFakeProductUrl(offer.rawUrl)) {
@@ -1021,6 +1292,7 @@ function loadState(): AppStateSnapshot {
               .filter((d) => !isFakeProductUrl(d.rawUrl))
               .map((d) => ({
                 ...d,
+                category: normalizeDealCategory(d.category, d.productName),
                 imageUrl: (d.imageUrl || '').replace(
                   /^https:\/\/i\.promobit\.com\.br\/520\//i,
                   'https://i.promobit.com.br/300/',
@@ -1349,15 +1621,21 @@ function pruneExpiredAndInvalidDeals(shouldBroadcast = false): boolean {
         continue;
       }
       const freshAffiliateUrl = buildAffiliateUrl(deal.rawUrl, store);
+      const fixedCategory = normalizeDealCategory(deal.category, deal.productName);
       const fixedImageUrl = (deal.imageUrl || '').replace(
         /^https:\/\/i\.promobit\.com\.br\/520\//i,
         'https://i.promobit.com.br/300/',
       );
-      if (freshAffiliateUrl !== deal.affiliateUrl || fixedImageUrl !== deal.imageUrl) {
+      if (
+        freshAffiliateUrl !== deal.affiliateUrl ||
+        fixedImageUrl !== deal.imageUrl ||
+        fixedCategory !== deal.category
+      ) {
         changed = true;
       }
       validDeals.push({
         ...deal,
+        category: fixedCategory,
         imageUrl: fixedImageUrl,
         storeName: store.name,
         affiliateUrl: freshAffiliateUrl,
@@ -1510,44 +1788,16 @@ const CATEGORY_TO_SEARCH_QUERY: Record<string, string> = {
   Monitores: 'monitor gamer',
   Notebooks: 'notebook',
   'Periféricos': 'teclado mouse gamer',
+  Tablets: 'tablet',
+  Games: 'playstation 5 controle',
+  Wearables: 'smartwatch',
+  'Beleza & Saúde': 'perfume secador',
+  Ferramentas: 'parafusadeira furadeira',
+  'Esporte & Lazer': 'tenis corrida mochila',
+  'Eletrônicos': 'eletronicos oferta',
 };
 
 let manualSearchCursor = Math.floor(Math.random() * LIVE_DEAL_TOPICS.length);
-
-function mapRetailerCategory(rawCat: string, fallback = 'Ofertas'): string {
-  const lower = rawCat
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
-  if (lower.includes('placa') || lower.includes('ssd') || lower.includes('hardware') || lower.includes('processador') || lower.includes('memoria')) {
-    return 'Hardware';
-  }
-  if (lower.includes('celular') || lower.includes('smartphone') || lower.includes('iphone')) {
-    return 'Smartphones';
-  }
-  if (lower.includes('fone') || lower.includes('headset') || lower.includes('audio') || lower.includes('caixa de som')) {
-    return 'Áudio';
-  }
-  if (lower.includes('monitor')) {
-    return 'Monitores';
-  }
-  if (lower.includes('tv') || lower.includes('televis')) {
-    return 'TV & Casa';
-  }
-  if (lower.includes('notebook') || lower.includes('computador')) {
-    return 'Notebooks';
-  }
-  if (lower.includes('teclado') || lower.includes('mouse') || lower.includes('perifer') || lower.includes('gamer')) {
-    return 'Periféricos';
-  }
-  if (lower.includes('eletro') || lower.includes('cozinha') || lower.includes('cafe') || lower.includes('fryer')) {
-    return 'Eletroportáteis';
-  }
-  if (lower.includes('tablet')) {
-    return 'Tablets';
-  }
-  return rawCat.trim() || fallback;
-}
 
 interface KabumApiItem {
   id: string | number;
@@ -1867,7 +2117,7 @@ const PROMOBIT_COUPON_ROUTES: Array<{path: string; category: string; keywords: s
   },
   {
     path: '/promocoes/esporte-e-lazer/',
-    category: 'Esporte',
+    category: 'Esporte & Lazer',
     keywords: ['tenis', 'corrida', 'bicicleta', 'academia', 'suplemento', 'whey', 'creatina', 'mochila'],
   },
   {
@@ -7910,6 +8160,62 @@ async function startServer() {
     res.setHeader('Content-Disposition', 'attachment; filename="mega-achados-027-economia-mensal.csv"');
     res.send(csv);
   });
+
+  // --- Native Android APK Download (API 24-36 / Android 7-16, zipaligned + APK Sig Scheme v2) ---
+
+  const handleAndroidApkDownload = (req: express.Request, res: express.Response) => {
+    try {
+      const forwardedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '')
+        .split(',')[0]
+        .trim()
+        .toLowerCase();
+      const hostOnly = forwardedHost.split(':')[0];
+
+      let targetUrl = '';
+      if (
+        forwardedHost &&
+        /^[a-z0-9.-]+(?::\d{1,5})?$/.test(forwardedHost) &&
+        isSafePublicRetailHost(hostOnly)
+      ) {
+        targetUrl = `https://${forwardedHost}`;
+      } else if (process.env.APP_URL && /^https:\/\/[a-z0-9.-]+/i.test(process.env.APP_URL.trim())) {
+        targetUrl = process.env.APP_URL.trim();
+      }
+
+      let apkBuffer: Buffer | null = null;
+      if (targetUrl) {
+        apkBuffer = buildSignedAndroidApkForUrl({
+          rootDir: __dirname,
+          targetUrl,
+        });
+      }
+
+      if (!apkBuffer) {
+        const staticApkPath = path.join(__dirname, 'public', 'downloads', 'mega-achados-027.apk');
+        if (fs.existsSync(staticApkPath)) {
+          apkBuffer = fs.readFileSync(staticApkPath);
+        }
+      }
+
+      if (!apkBuffer) {
+        res.status(404).json({error: 'Arquivo APK não encontrado no servidor.'});
+        return;
+      }
+
+      res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+      res.setHeader('Content-Disposition', 'attachment; filename="Mega-Achados-027.apk"');
+      res.setHeader('Content-Length', String(apkBuffer.length));
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(apkBuffer);
+    } catch (err) {
+      console.error('Error serving Android APK:', err);
+      res.status(500).json({error: 'Não foi possível gerar o arquivo APK agora.'});
+    }
+  };
+
+  app.get('/api/download/mega-achados-027.apk', handleAndroidApkDownload);
+  app.get('/api/download/android-apk', handleAndroidApkDownload);
 
   // --- HTTP + WebSocket Server ---
 

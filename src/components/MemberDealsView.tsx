@@ -119,9 +119,13 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
 
   const categories = useMemo(() => {
     const set = new Set<string>();
-    products.forEach((p) => set.add(p.category));
-    announcedDeals.forEach((d) => set.add(d.category));
-    return Array.from(set);
+    const addClean = (cat?: string) => {
+      const clean = (cat || '').trim();
+      if (clean && clean.length <= 28) set.add(clean);
+    };
+    products.forEach((p) => addClean(p.category));
+    announcedDeals.forEach((d) => addClean(d.category));
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'pt-BR'));
   }, [products, announcedDeals]);
 
   const activeCouponDealsCount = useMemo(
