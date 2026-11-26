@@ -1,5 +1,70 @@
 import type {AffiliateMode, StoreConfig} from '../types.ts';
 
+const ML_TRACKING_PARAMS = [
+  'matt_word',
+  'matt_tool',
+  'matt_source',
+  'matt_campaign',
+  'matt_ad_group',
+  'matt_ad',
+  'matt_match_type',
+  'matt_network',
+  'matt_device',
+  'matt_creative',
+  'matt_keyword',
+  'forceInApp',
+  'ref',
+];
+
+const SHORT_AFFILIATE_HOSTS = new Set([
+  'meli.la',
+  'amzn.to',
+  'a.co',
+  'shp.ee',
+  's.shopee.com.br',
+  'divulgador.magalu.com',
+  'magalu.lu',
+]);
+
+export function isShortAffiliateUrl(inputUrl: string): boolean {
+  const trimmed = inputUrl.trim();
+  if (!trimmed) return false;
+  const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (SHORT_AFFILIATE_HOSTS.has(host)) return true;
+    if (
+      (host === 'mercadolivre.com' || host === 'mercadolivre.com.br') &&
+      parsed.pathname.toLowerCase().startsWith('/sec/')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function isAlreadyOfficialMlAffiliateUrl(parsed: URL): boolean {
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  if (host === 'meli.la') return true;
+  if (
+    (host === 'mercadolivre.com' || host === 'mercadolivre.com.br') &&
+    parsed.pathname.toLowerCase().startsWith('/sec/')
+  ) {
+    return true;
+  }
+  if (
+    (host.includes('mercadolivre.') || host.includes('mercadolibre.')) &&
+    parsed.pathname.toLowerCase().startsWith('/social/') &&
+    parsed.searchParams.has('ref')
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Generates an affiliate-tagged URL for a given raw product URL and store configuration.
  * Ensures every link dispatched via WhatsApp, Push, Social Share, or direct clicks
@@ -16,6 +81,12 @@ export function buildAffiliateUrl(rawUrl: string, store?: StoreConfig | null): s
 
   try {
     const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+
+    // Preserve official Mercado Livre affiliate links (meli.la, /sec/, or /social/...&ref=...) untouched
+    if (isAlreadyOfficialMlAffiliateUrl(parsed)) {
+      return parsed.toString();
+    }
 
     if (store.affiliateMode === 'template' && store.affiliateTemplate.trim()) {
       return store.affiliateTemplate
@@ -35,6 +106,59 @@ export function buildAffiliateUrl(rawUrl: string, store?: StoreConfig | null): s
       }
       const cleanPath = parsed.pathname.replace(/^\//, '');
       parsed.pathname = `/${encodeURIComponent(tag)}/${cleanPath}`;
+      return parsed.toString();
+    }
+
+    const isMercadoLivre =
+      store.id === 'mercadolivre' ||
+      host.includes('mercadolivre.') ||
+      host.includes('mercadolibre.');
+
+    if (isMercadoLivre) {
+      // Remove any stale or third-party Mercado Livre tracking parameters before injecting our own
+      for (const key of ML_TRACKING_PARAMS) {
+        parsed.searchParams.delete(key);
+      }
+
+      // If user pasted a full ML /social/ or product URL directly into affiliateTag, extract params safely
+      if (/^https?:\/\//i.test(tag)) {
+        try {
+          const tagUrl = new URL(tag);
+          const mlWord =
+            tagUrl.searchParams.get('matt_word') ||
+            tagUrl.pathname.match(/^\/social\/([^/?#]+)/i)?.[1] ||
+            '';
+          const mlTool = tagUrl.searchParams.get('matt_tool') || '';
+          const forceInApp = tagUrl.searchParams.get('forceInApp') || 'true';
+          if (mlWord) parsed.searchParams.set('matt_word', mlWord);
+          if (mlTool) parsed.searchParams.set('matt_tool', mlTool);
+          if (mlWord || mlTool) parsed.searchParams.set('forceInApp', forceInApp);
+          return parsed.toString();
+        } catch {
+          // Fall through to standard parsing
+        }
+      }
+
+      if (tag.includes('=')) {
+        const extraParams = new URLSearchParams(tag);
+        extraParams.forEach((value, key) => {
+          // Never copy a single-product encrypted `ref` token onto other products
+          if (key.toLowerCase() === 'ref') return;
+          if (value.trim()) {
+            parsed.searchParams.set(key, value.trim());
+          }
+        });
+      } else {
+        parsed.searchParams.set(param || 'matt_word', tag);
+      }
+
+      if (
+        (parsed.searchParams.has('matt_word') || parsed.searchParams.has('matt_tool')) &&
+        !parsed.searchParams.has('forceInApp')
+      ) {
+        parsed.searchParams.set('forceInApp', 'true');
+      }
+
       return parsed.toString();
     }
 
@@ -128,18 +252,21 @@ export function extractAffiliateInfoFromUrl(inputUrl: string): DetectedAffiliate
       }
     }
 
-    // 4. Mercado Livre Afiliados
+    // 4. Mercado Livre Afiliados (suporta links diretos, /social/{etiqueta} e meli.la expandidos)
     if (host.includes('mercadolivre.') || host.includes('mercadolibre.')) {
-      const mattWord = params.get('matt_word');
+      const socialSlug = parsed.pathname.match(/^\/social\/([^/?#]+)/i)?.[1] || null;
+      const mattWord = params.get('matt_word') || socialSlug;
       const mattTool = params.get('matt_tool');
+      const forceInApp = params.get('forceInApp') || 'true';
       if (mattTool && mattWord) {
         return {
           storeId: 'mercadolivre',
           storeName: 'Mercado Livre',
           affiliateMode: 'query',
           affiliateParam: 'matt_word',
-          affiliateTag: `matt_tool=${mattTool}&matt_word=${mattWord}`,
-          explanation: `Parâmetros completos do Mercado Livre Afiliados detectados (matt_tool e matt_word).`,
+          affiliateTag: `matt_word=${mattWord}&matt_tool=${mattTool}&forceInApp=${forceInApp}`,
+          affiliateTemplate: '{raw_url}?{id}',
+          explanation: `Parâmetros completos do Mercado Livre Afiliados detectados (matt_word=${mattWord}, matt_tool=${mattTool} e forceInApp=${forceInApp}).`,
         };
       }
       if (mattWord || mattTool) {
@@ -150,8 +277,9 @@ export function extractAffiliateInfoFromUrl(inputUrl: string): DetectedAffiliate
           storeName: 'Mercado Livre',
           affiliateMode: 'query',
           affiliateParam: paramKey,
-          affiliateTag: val,
-          explanation: `Identificador do Mercado Livre detectado no parâmetro "${paramKey}=${val}".`,
+          affiliateTag: `${paramKey}=${val}&forceInApp=${forceInApp}`,
+          affiliateTemplate: '{raw_url}?{id}',
+          explanation: `Identificador do Mercado Livre detectado ("${paramKey}=${val}"). Dica: cole um link gerado pelo Gerador de Links (meli.la ou /social/) para incluir também o matt_tool.`,
         };
       }
     }

@@ -8,7 +8,7 @@ import {
   Wand2,
 } from 'lucide-react';
 import type {StoreConfig} from '../types.ts';
-import {extractAffiliateInfoFromUrl} from '../utils/affiliate.ts';
+import {extractAffiliateInfoFromUrl, isShortAffiliateUrl} from '../utils/affiliate.ts';
 import type {DetectedAffiliateInfo} from '../utils/affiliate.ts';
 
 interface AffiliateTutorialPanelProps {
@@ -50,16 +50,17 @@ const STORE_GUIDES: StoreGuide[] = [
     label: 'Mercado Livre',
     portal: 'mercadolivre.com.br/afiliados',
     modeLabel: 'Parâmetro na URL',
-    paramLabel: 'matt_word',
-    exampleTag: 'matt_tool=58291044&matt_word=megaachados027',
-    exampleUrl: 'https://www.mercadolivre.com.br/p/MLB12345?matt_tool=58291044&matt_word=megaachados027',
+    paramLabel: 'matt_word + matt_tool + forceInApp',
+    exampleTag: 'matt_word=mh20241004134402&matt_tool=88747486&forceInApp=true',
+    exampleUrl:
+      'https://www.mercadolivre.com.br/p/MLB18917848?matt_word=mh20241004134402&matt_tool=88747486&forceInApp=true',
     steps: [
-      'Acesse o Portal de Afiliados do Mercado Livre e abra a ferramenta "Link Builder" (Gerador de Links).',
-      'Gere um link de qualquer produto e abra esse link no navegador para ver a URL completa (não a versão encurtada mercadolivre.com/sec/...).',
-      'Na barra de endereço, localize os parâmetros "matt_tool=" e "matt_word=" (sua etiqueta de campanha).',
-      'Cole no campo "Seu ID / Tag" apenas a sua matt_word ou os dois juntos no formato "matt_tool=NUMERO&matt_word=SUATAG".',
+      'Acesse a Central de Afiliados e Criadores do Mercado Livre e abra o "Gerador de links".',
+      'Gere um link de qualquer produto — pode copiar tanto o link curto (https://meli.la/...) quanto o link completo (/social/...?matt_word=...&matt_tool=...).',
+      'Cole esse link no Extrator Automático ao lado: o sistema expande o meli.la sozinho e extrai sua etiqueta (matt_word), seu matt_tool e forceInApp=true.',
+      'Clique em "Aplicar Tag em Mercado Livre" para atualizar todos os alertas e ofertas do site imediatamente.',
     ],
-    tip: 'Cole o link expandido do Mercado Livre no Extrator Automático abaixo para preenchermos matt_tool e matt_word sem erro.',
+    tip: 'Você pode colar links curtos https://meli.la/... direto no Extrator Automático ao lado — nós expandimos automaticamente para capturar matt_word, matt_tool e forceInApp=true.',
   },
   {
     id: 'shopee',
@@ -136,29 +137,69 @@ export const AffiliateTutorialPanel: React.FC<AffiliateTutorialPanelProps> = ({
   const [pasteUrl, setPasteUrl] = useState('');
   const [detected, setDetected] = useState<DetectedAffiliateInfo | null>(null);
   const [extractError, setExtractError] = useState<string | null>(null);
+  const [expandingShortUrl, setExpandingShortUrl] = useState(false);
   const [applying, setApplying] = useState(false);
   const [appliedMsg, setAppliedMsg] = useState<string | null>(null);
 
   const activeGuide = STORE_GUIDES.find((g) => g.id === activeGuideId) || STORE_GUIDES[0];
 
-  const handleAnalyzeUrl = (value: string) => {
+  const handleAnalyzeUrl = async (value: string) => {
     setPasteUrl(value);
     setAppliedMsg(null);
     if (!value.trim()) {
       setDetected(null);
       setExtractError(null);
+      setExpandingShortUrl(false);
       return;
     }
-    const result = extractAffiliateInfoFromUrl(value);
-    if (result) {
-      setDetected(result);
+
+    const directResult = extractAffiliateInfoFromUrl(value);
+    if (directResult) {
+      setDetected(directResult);
       setExtractError(null);
-    } else {
-      setDetected(null);
-      setExtractError(
-        'Não identificamos uma tag de afiliado nessa URL. Certifique-se de colar a URL completa (expandida) contendo parâmetros como ?tag=, matt_word=, af_siteid=, awinaffid= ou magazinevoce.com.br/sualoja.',
-      );
+      setExpandingShortUrl(false);
+      return;
     }
+
+    if (isShortAffiliateUrl(value)) {
+      setExpandingShortUrl(true);
+      setExtractError(null);
+      setDetected(null);
+      try {
+        const res = await fetch('/api/affiliate/expand-url', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({url: value.trim()}),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {expandedUrl?: string};
+          if (data.expandedUrl) {
+            const expandedResult = extractAffiliateInfoFromUrl(data.expandedUrl);
+            if (expandedResult) {
+              setDetected(expandedResult);
+              setExtractError(null);
+              return;
+            }
+          }
+        }
+        setExtractError(
+          'Não conseguimos ler os parâmetros dentro desse link encurtado. Abra o link no navegador, copie o endereço completo da barra e cole aqui.',
+        );
+      } catch {
+        setExtractError(
+          'Erro ao expandir link encurtado. Abra o link no navegador e cole a URL completa aqui.',
+        );
+      } finally {
+        setExpandingShortUrl(false);
+      }
+      return;
+    }
+
+    setDetected(null);
+    setExpandingShortUrl(false);
+    setExtractError(
+      'Não identificamos uma tag de afiliado nessa URL. Cole um link encurtado (ex: https://meli.la/...) ou a URL completa contendo ?tag=, matt_word=, matt_tool=, af_siteid=, awinaffid= ou magazinevoce.com.br/sualoja.',
+    );
   };
 
   const handleApplyDetected = async () => {
@@ -296,10 +337,16 @@ export const AffiliateTutorialPanel: React.FC<AffiliateTutorialPanelProps> = ({
                 <input
                   type="text"
                   value={pasteUrl}
-                  onChange={(e) => handleAnalyzeUrl(e.target.value)}
-                  placeholder="Cole aqui seu link (ex: https://amazon.com.br/dp/...?tag=sua-tag-20)"
+                  onChange={(e) => void handleAnalyzeUrl(e.target.value)}
+                  placeholder="Cole seu link (ex: https://meli.la/... ou https://amazon.com.br/dp/...?tag=sua-tag-20)"
                   className="w-full min-h-[40px] px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#13141A] text-xs font-mono text-zinc-900 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
                 />
+
+                {expandingShortUrl && (
+                  <p className="text-xs text-amber-700 dark:text-yellow-400">
+                    Expandindo link encurtado para extrair sua tag...
+                  </p>
+                )}
 
                 {detected && (
                   <div className="p-3 rounded-xl bg-white dark:bg-[#13141A] border border-amber-300 dark:border-yellow-500/40 space-y-2">

@@ -12,6 +12,7 @@ import {
 import type {AffiliateMode, StoreConfig} from '../types.ts';
 import {buildAffiliateUrl} from '../utils/affiliate.ts';
 import {AffiliateTutorialPanel} from './AffiliateTutorialPanel.tsx';
+import {AdminMercadoLivreConnector} from './AdminMercadoLivreConnector.tsx';
 
 interface StoresAffiliatesViewProps {
   stores: StoreConfig[];
@@ -153,6 +154,9 @@ export const StoresAffiliatesView: React.FC<StoresAffiliatesViewProps> = ({
         </button>
       </div>
 
+      {/* Admin-only Mercado Livre Account Session & Official meli.la Link Builder */}
+      <AdminMercadoLivreConnector />
+
       {/* Mini Tutorial + Automatic Affiliate Tag Extractor */}
       <AffiliateTutorialPanel stores={stores} onApplyDetected={handleApplyFromTutorial} />
 
@@ -183,8 +187,17 @@ export const StoresAffiliatesView: React.FC<StoresAffiliatesViewProps> = ({
         {stores.map((store) => {
           const val = getStoreValue(store);
           const hasUnsaved = Boolean(drafts[store.id]);
-          const sampleRawUrl =
-            testUrlInput[store.id] || `https://www.${val.domain}/produto/oferta-destaque-2026`;
+          const defaultSampleUrl =
+            store.id === 'mercadolivre'
+              ? 'https://www.mercadolivre.com.br/p/MLB18917848'
+              : store.id === 'amazon'
+                ? 'https://www.amazon.com.br/dp/B0CS12345'
+                : store.id === 'kabum'
+                  ? 'https://www.kabum.com.br/produto/520369'
+                  : store.id === 'magalu'
+                    ? 'https://www.magazineluiza.com.br/produto-oferta/p/234567800/'
+                    : `https://www.${val.domain}/produto/oferta-destaque-2026`;
+          const sampleRawUrl = testUrlInput[store.id] || defaultSampleUrl;
           const generatedAffiliateUrl = buildAffiliateUrl(sampleRawUrl, val);
 
           return (

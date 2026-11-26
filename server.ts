@@ -39,8 +39,28 @@ import {
   BRAZILIAN_INTERNATIONAL_AIRPORTS,
   INTERNATIONAL_DESTINATIONS,
 } from './src/data/airports.ts';
-import {buildAffiliateUrl, formatWhatsAppPromoMessage} from './src/utils/affiliate.ts';
+import {
+  buildAffiliateUrl as buildBaseAffiliateUrl,
+  formatWhatsAppPromoMessage,
+} from './src/utils/affiliate.ts';
 import {normalizePhoneE164} from './src/utils/phone.ts';
+import {
+  clearMlSession,
+  generateMlAffiliateLinkWithSession,
+  getCachedMlShortUrl,
+  getMlSessionStatus,
+  isMlSessionConnected,
+  parseMlSessionInput,
+  saveMlSession,
+} from './server-utils/mlLinkBuilder.ts';
+
+function buildAffiliateUrl(rawUrl: string, store?: StoreConfig | null): string {
+  if (store?.id === 'mercadolivre' && rawUrl) {
+    const cachedShort = getCachedMlShortUrl(rawUrl);
+    if (cachedShort) return cachedShort;
+  }
+  return buildBaseAffiliateUrl(rawUrl, store);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -87,6 +107,9 @@ function buildDealFeedMeta(nowMs: number, isPublishing = false): DealFeedMeta {
 const DEFAULT_WHATSAPP_TEMPLATE =
   '⚡ *MEGA ACHADOS 027 — OFERTA ENCONTRADA*\n\n📦 {produto}\n🏪 Loja: {loja}\n💸 De {preco_anterior} por *{preco}* ({desconto} OFF)\n\n🔗 Comprar com desconto:\n{link}';
 
+const DEFAULT_ML_AFFILIATE_TAG =
+  'matt_word=mh20241004134402&matt_tool=88747486&forceInApp=true';
+
 function createDefaultStores(): StoreConfig[] {
   return [
     {
@@ -110,8 +133,8 @@ function createDefaultStores(): StoreConfig[] {
       accentHex: '#FACC15',
       affiliateMode: 'query',
       affiliateParam: 'matt_word',
-      affiliateTag: 'megaachados027',
-      affiliateTemplate: '{raw_url}?matt_word={id}',
+      affiliateTag: DEFAULT_ML_AFFILIATE_TAG,
+      affiliateTemplate: '{raw_url}?{id}',
       defaultShipping: 'Chega amanhã Full',
       installmentsInfo: '12x sem juros',
     },
@@ -1242,10 +1265,27 @@ function loadState(): AppStateSnapshot {
         if (parsed.botConfig?.whatsappTemplate?.includes('OfertaRadar')) {
           parsed.botConfig.whatsappTemplate = DEFAULT_WHATSAPP_TEMPLATE;
         }
-        const stores = parsed.stores.map((s) => ({
-          ...s,
-          affiliateTag: s.affiliateTag.replace(/ofertaradar/gi, 'megaachados027'),
-        }));
+        const stores = parsed.stores.map((s) => {
+          let affiliateTag = s.affiliateTag.replace(/ofertaradar/gi, 'megaachados027');
+          let affiliateTemplate = s.affiliateTemplate;
+          if (s.id === 'mercadolivre') {
+            const trimmedTag = affiliateTag.trim().toLowerCase();
+            if (
+              !trimmedTag ||
+              trimmedTag === 'megaachados027' ||
+              trimmedTag === 'mh20241004134402' ||
+              (trimmedTag.includes('mh20241004134402') && !trimmedTag.includes('matt_tool='))
+            ) {
+              affiliateTag = DEFAULT_ML_AFFILIATE_TAG;
+              affiliateTemplate = '{raw_url}?{id}';
+            }
+          }
+          return {
+            ...s,
+            affiliateTag,
+            affiliateTemplate,
+          };
+        });
         const storeById = new Map(stores.map((s) => [s.id, s]));
 
         // Migrate any legacy synthetic /produto/<slug> URLs and sanitize categories
@@ -1274,6 +1314,8 @@ function loadState(): AppStateSnapshot {
           let affiliateUrl = a.affiliateUrl;
           if (store && isFakeProductUrl(rawUrl)) {
             rawUrl = buildValidStoreSearchUrl(store, a.productName);
+          }
+          if (store) {
             affiliateUrl = buildAffiliateUrl(rawUrl, store);
           }
           const cleanedMsg = a.whatsappMessage
@@ -1290,20 +1332,29 @@ function loadState(): AppStateSnapshot {
         const announcedDeals = Array.isArray(parsed.announcedDeals)
           ? parsed.announcedDeals
               .filter((d) => !isFakeProductUrl(d.rawUrl))
-              .map((d) => ({
-                ...d,
-                category: normalizeDealCategory(d.category, d.productName),
-                imageUrl: (d.imageUrl || '').replace(
-                  /^https:\/\/i\.promobit\.com\.br\/520\//i,
-                  'https://i.promobit.com.br/300/',
-                ),
-              }))
+              .map((d) => {
+                const store = storeById.get(d.storeId);
+                return {
+                  ...d,
+                  affiliateUrl: store ? buildAffiliateUrl(d.rawUrl, store) : d.affiliateUrl,
+                  category: normalizeDealCategory(d.category, d.productName),
+                  imageUrl: (d.imageUrl || '').replace(
+                    /^https:\/\/i\.promobit\.com\.br\/520\//i,
+                    'https://i.promobit.com.br/300/',
+                  ),
+                };
+              })
           : [];
 
         const nowMs = Date.now();
         const coupons =
           Array.isArray(parsed.coupons) && parsed.coupons.length > 0
-            ? parsed.coupons
+            ? parsed.coupons.map((c) => {
+                const store = storeById.get(c.storeId);
+                return store && c.affiliateUrl
+                  ? {...c, affiliateUrl: buildAffiliateUrl(c.affiliateUrl, store)}
+                  : c;
+              })
             : buildVerifiedStoreCoupons(stores, nowMs);
         const couponMeta: CouponSyncMeta =
           parsed.couponMeta && parsed.couponMeta.nextRefreshAt
@@ -3416,10 +3467,15 @@ async function ensureDirectProductUrlsForDeals(
     // Fast path: already a direct product URL (e.g. fetchLiveAmazonDeals / fetchLiveKabumDeals)
     const immediate = canonicalizeDirectStoreProductUrl(deal.rawUrl, store, deal.productName);
     if (immediate) {
+      let affUrl = buildAffiliateUrl(immediate, store);
+      if (store.id === 'mercadolivre' && isMlSessionConnected() && !/^https:\/\/meli\.la\//i.test(affUrl)) {
+        const mlGen = await generateMlAffiliateLinkWithSession(immediate);
+        if (mlGen.ok && mlGen.shortUrl) affUrl = mlGen.shortUrl;
+      }
       verified.push({
         ...deal,
         rawUrl: immediate,
-        affiliateUrl: buildAffiliateUrl(immediate, store),
+        affiliateUrl: affUrl,
       });
       continue;
     }
@@ -3435,10 +3491,15 @@ async function ensureDirectProductUrlsForDeals(
     });
 
     if (directUrl && !isStoreSearchUrl(directUrl)) {
+      let affUrl = buildAffiliateUrl(directUrl, store);
+      if (store.id === 'mercadolivre' && isMlSessionConnected() && !/^https:\/\/meli\.la\//i.test(affUrl)) {
+        const mlGen = await generateMlAffiliateLinkWithSession(directUrl);
+        if (mlGen.ok && mlGen.shortUrl) affUrl = mlGen.shortUrl;
+      }
       verified.push({
         ...deal,
         rawUrl: directUrl,
-        affiliateUrl: buildAffiliateUrl(directUrl, store),
+        affiliateUrl: affUrl,
       });
     }
   }
@@ -5097,7 +5158,7 @@ function parseTelegramMigrationPayload(rawInput: string): ParsedTelegramRule[] {
   return rules;
 }
 
-// Re-sync all alert affiliate URLs whenever a store's affiliate configuration changes
+// Re-sync all alert and announced deal affiliate URLs whenever a store's affiliate configuration changes
 function refreshAffiliateLinksForStore(store: StoreConfig) {
   state.alerts = state.alerts.map((alert) => {
     if (alert.storeId !== store.id) return alert;
@@ -5116,6 +5177,15 @@ function refreshAffiliateLinksForStore(store: StoreConfig) {
       storeName: store.name,
       affiliateUrl,
       whatsappMessage,
+    };
+  });
+
+  state.announcedDeals = state.announcedDeals.map((deal) => {
+    if (deal.storeId !== store.id) return deal;
+    return {
+      ...deal,
+      storeName: store.name,
+      affiliateUrl: buildAffiliateUrl(deal.rawUrl, store),
     };
   });
 }
@@ -6146,7 +6216,341 @@ async function startServer() {
     broadcast('store:updated', updated);
     broadcast('alerts:synced', state.alerts);
     broadcast('coupons:synced', {coupons: state.coupons, couponMeta: state.couponMeta});
+    broadcast('state:synced', state);
     res.json(updated);
+  });
+
+  const AFFILIATE_EXPAND_ALLOWED_HOSTS = new Set([
+    'meli.la',
+    'mercadolivre.com',
+    'www.mercadolivre.com',
+    'mercadolivre.com.br',
+    'www.mercadolivre.com.br',
+    'produto.mercadolivre.com.br',
+    'mercadolibre.com.br',
+    'www.mercadolibre.com.br',
+    'amzn.to',
+    'a.co',
+    'amazon.com.br',
+    'www.amazon.com.br',
+    'shp.ee',
+    's.shopee.com.br',
+    'shopee.com.br',
+    'www.shopee.com.br',
+    'divulgador.magalu.com',
+    'magalu.lu',
+    'magazineluiza.com.br',
+    'www.magazineluiza.com.br',
+    'magazinevoce.com.br',
+    'www.magazinevoce.com.br',
+    'awin1.com',
+    'www.awin1.com',
+  ]);
+
+  app.post('/api/affiliate/expand-url', async (req, res) => {
+    const raw = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    if (!raw || raw.length > 2048) {
+      res.status(400).json({error: 'URL inválida.'});
+      return;
+    }
+
+    const normalized = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    let currentUrl: URL;
+    try {
+      currentUrl = new URL(normalized);
+    } catch {
+      res.status(400).json({error: 'Formato de URL inválido.'});
+      return;
+    }
+
+    const isAllowedExpandUrl = (u: URL): boolean => {
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+      if (u.username || u.password) return false;
+      if (u.port && u.port !== '80' && u.port !== '443') return false;
+      const host = u.hostname.toLowerCase();
+      return AFFILIATE_EXPAND_ALLOWED_HOSTS.has(host);
+    };
+
+    if (!isAllowedExpandUrl(currentUrl)) {
+      res.status(400).json({error: 'Domínio não suportado para expansão automática.'});
+      return;
+    }
+
+    try {
+      let resolved = currentUrl.toString();
+      for (let hop = 0; hop < 5; hop++) {
+        const parsedHop = new URL(resolved);
+        if (!isAllowedExpandUrl(parsedHop)) break;
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 6000);
+        try {
+          const response = await fetch(resolved, {
+            method: 'GET',
+            redirect: 'manual',
+            signal: controller.signal,
+            headers: {
+              'user-agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+              accept: 'text/html,application/xhtml+xml',
+            },
+          });
+          const location = response.headers.get('location');
+          if (!location || response.status < 300 || response.status >= 400) {
+            break;
+          }
+          const nextUrl = new URL(location, resolved);
+          if (!isAllowedExpandUrl(nextUrl)) {
+            break;
+          }
+          resolved = nextUrl.toString();
+          // Stop as soon as we reach an expanded Mercado Livre / affiliate URL with tracking params
+          if (
+            nextUrl.searchParams.has('matt_tool') ||
+            nextUrl.searchParams.has('matt_word') ||
+            nextUrl.searchParams.has('tag') ||
+            nextUrl.searchParams.has('awinaffid') ||
+            nextUrl.searchParams.has('af_siteid')
+          ) {
+            break;
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      res.json({expandedUrl: resolved});
+    } catch {
+      res.status(502).json({error: 'Não foi possível expandir o link encurtado no momento.'});
+    }
+  });
+
+  // --- Admin-only Mercado Livre Link Builder Session & meli.la Generator ---
+  const ADMIN_BOOTSTRAP_EMAIL = 'heitormodder_yt@hotmail.com';
+  const firebaseWebApiKey = (() => {
+    try {
+      const cfgPath = path.resolve(__dirname, 'firebase-applet-config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as {apiKey?: string};
+        return typeof cfg.apiKey === 'string' ? cfg.apiKey.trim() : '';
+      }
+    } catch {
+      // Ignore
+    }
+    return '';
+  })();
+
+  const verifiedFirebaseAdminCache = new Map<string, {email: string; expiresAt: number}>();
+
+  async function verifyAdminRequest(req: express.Request): Promise<boolean> {
+    // 1. Check local account session (email/password account matching admin email)
+    const localAccount = getAuthenticatedLocalAccount(req, true);
+    if (localAccount?.email && localAccount.email.toLowerCase() === ADMIN_BOOTSTRAP_EMAIL) {
+      return true;
+    }
+
+    // 2. Check Firebase ID token via Firebase Identity Toolkit server-side lookup
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ') || !firebaseWebApiKey) {
+      return false;
+    }
+    const idToken = authHeader.slice(7).trim();
+    if (!idToken || idToken.length < 40 || idToken.length > 4096) {
+      return false;
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(idToken).digest('hex');
+    const cached = verifiedFirebaseAdminCache.get(tokenHash);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.email === ADMIN_BOOTSTRAP_EMAIL;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      const lookupRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseWebApiKey)}`,
+        {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({idToken}),
+        },
+      );
+      if (!lookupRes.ok) return false;
+      const lookupJson = (await lookupRes.json()) as {
+        users?: Array<{email?: string; emailVerified?: boolean}>;
+      };
+      const firstUser = lookupJson.users?.[0];
+      const email = (firstUser?.email || '').trim().toLowerCase();
+      if (firstUser?.emailVerified && email === ADMIN_BOOTSTRAP_EMAIL) {
+        verifiedFirebaseAdminCache.set(tokenHash, {
+          email,
+          expiresAt: Date.now() + 2 * 60 * 1000,
+        });
+        if (verifiedFirebaseAdminCache.size > 100) {
+          const oldest = verifiedFirebaseAdminCache.keys().next().value;
+          if (oldest) verifiedFirebaseAdminCache.delete(oldest);
+        }
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  app.get('/api/admin/mercadolivre-session', async (req, res) => {
+    if (!(await verifyAdminRequest(req))) {
+      res.status(403).json({error: 'Acesso restrito ao administrador.'});
+      return;
+    }
+    res.json(getMlSessionStatus());
+  });
+
+  app.post('/api/admin/mercadolivre-session', async (req, res) => {
+    if (!(await verifyAdminRequest(req))) {
+      res.status(403).json({error: 'Acesso restrito ao administrador.'});
+      return;
+    }
+    const rawInput = typeof req.body?.rawInput === 'string' ? req.body.rawInput : '';
+    const tag = typeof req.body?.tag === 'string' ? req.body.tag.trim() : 'mh20241004134402';
+    const verifyNow = req.body?.verifyNow !== false;
+
+    if (!rawInput.trim() || rawInput.length > 32768) {
+      res.status(400).json({error: 'Cole o comando cURL ou o Cookie da sua sessão do Mercado Livre.'});
+      return;
+    }
+
+    const parsed = parseMlSessionInput(rawInput, tag);
+    if (!parsed) {
+      res.status(400).json({
+        error:
+          'Não encontramos um cabeçalho Cookie válido no texto colado. Copie o comando "Copiar como cURL" da requisição createLink ou a string Cookie completa.',
+      });
+      return;
+    }
+
+    saveMlSession(parsed);
+
+    if (!verifyNow) {
+      res.json({
+        status: getMlSessionStatus(),
+        verified: false,
+        testShortUrl: null,
+      });
+      return;
+    }
+
+    const testResult = await generateMlAffiliateLinkWithSession(
+      'https://www.mercadolivre.com.br/p/MLB18917848',
+      {bypassCache: true},
+    );
+
+    res.json({
+      status: getMlSessionStatus(),
+      verified: testResult.ok,
+      testShortUrl: testResult.shortUrl,
+      message: testResult.ok
+        ? `Sessão validada com sucesso (${testResult.shortUrl}).`
+        : testResult.error || 'Sessão salva, mas o teste de geração falhou.',
+    });
+  });
+
+  app.delete('/api/admin/mercadolivre-session', async (req, res) => {
+    if (!(await verifyAdminRequest(req))) {
+      res.status(403).json({error: 'Acesso restrito ao administrador.'});
+      return;
+    }
+    const status = clearMlSession();
+    res.json({ok: true, status});
+  });
+
+  app.post('/api/admin/mercadolivre-session/generate', async (req, res) => {
+    if (!(await verifyAdminRequest(req))) {
+      res.status(403).json({error: 'Acesso restrito ao administrador.'});
+      return;
+    }
+    if (!isMlSessionConnected()) {
+      res.status(400).json({error: 'Conecte sua conta do Mercado Livre primeiro.'});
+      return;
+    }
+
+    const rawUrls = Array.isArray(req.body?.urls) ? req.body.urls : [];
+    const urls = rawUrls
+      .filter((u: unknown): u is string => typeof u === 'string' && u.trim().length > 0)
+      .slice(0, 20);
+
+    if (urls.length === 0) {
+      res.status(400).json({error: 'Informe pelo menos 1 URL de produto do Mercado Livre.'});
+      return;
+    }
+
+    const results = [];
+    for (let i = 0; i < urls.length; i++) {
+      const gen = await generateMlAffiliateLinkWithSession(urls[i]);
+      results.push(gen);
+      if (i < urls.length - 1 && !gen.cached) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+
+    // Apply any newly cached meli.la links to matching ML deals/alerts
+    const mlStore = state.stores.find((s) => s.id === 'mercadolivre');
+    if (mlStore) {
+      refreshAffiliateLinksForStore(mlStore);
+      saveState(state);
+      broadcast('state:synced', state);
+    }
+
+    res.json({results, status: getMlSessionStatus()});
+  });
+
+  app.post('/api/admin/mercadolivre-session/sync-deals', async (req, res) => {
+    if (!(await verifyAdminRequest(req))) {
+      res.status(403).json({error: 'Acesso restrito ao administrador.'});
+      return;
+    }
+    if (!isMlSessionConnected()) {
+      res.status(400).json({error: 'Conecte sua conta do Mercado Livre primeiro.'});
+      return;
+    }
+
+    const mlStore = state.stores.find((s) => s.id === 'mercadolivre');
+    if (!mlStore) {
+      res.status(404).json({error: 'Loja Mercado Livre não configurada.'});
+      return;
+    }
+
+    const mlDeals = state.announcedDeals.filter(
+      (d) => d.storeId === 'mercadolivre' && !/^https:\/\/meli\.la\//i.test(d.affiliateUrl || ''),
+    );
+
+    let convertedCount = 0;
+    for (let i = 0; i < mlDeals.length && i < 20; i++) {
+      const deal = mlDeals[i];
+      const gen = await generateMlAffiliateLinkWithSession(deal.rawUrl);
+      if (gen.ok && gen.shortUrl) {
+        convertedCount++;
+      }
+      if (i < mlDeals.length - 1 && !gen.cached) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+
+    if (convertedCount > 0) {
+      refreshAffiliateLinksForStore(mlStore);
+      saveState(state);
+      broadcast('state:synced', state);
+    }
+
+    res.json({
+      convertedCount,
+      totalChecked: Math.min(mlDeals.length, 20),
+      status: getMlSessionStatus(),
+    });
   });
 
   app.delete('/api/stores/:id', (req, res) => {

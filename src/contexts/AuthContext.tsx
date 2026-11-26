@@ -129,6 +129,7 @@ interface AuthContextValue {
   saveForwarderSettings: (input: SaveForwarderSettingsInput) => Promise<void>;
   adminToggleSubscriberOptIn: (targetUid: string, optIn: boolean) => Promise<void>;
   adminRemoveSubscriber: (targetUid: string) => Promise<void>;
+  getAdminAuthHeaders: () => Promise<Record<string, string>>;
   signOutUser: () => Promise<void>;
 }
 
@@ -1199,6 +1200,27 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
     }
   }, [firebaseUser, localUser]);
 
+  const getAdminAuthHeaders = useCallback(async (): Promise<Record<string, string>> => {
+    const headers: Record<string, string> = {
+      'X-Requested-With': 'MegaAchadosApp',
+    };
+    if (firebaseUser) {
+      try {
+        const idToken = await firebaseUser.getIdToken();
+        if (idToken) {
+          headers.Authorization = `Bearer ${idToken}`;
+          return headers;
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+    if (localTokenRef.current) {
+      headers.Authorization = `Bearer ${localTokenRef.current}`;
+    }
+    return headers;
+  }, [firebaseUser]);
+
   return (
     <AuthContext.Provider
       value={{
@@ -1232,6 +1254,7 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
         saveForwarderSettings,
         adminToggleSubscriberOptIn,
         adminRemoveSubscriber,
+        getAdminAuthHeaders,
         signOutUser,
       }}
     >
