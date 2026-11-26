@@ -322,37 +322,57 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
       </div>
 
       {/* Product Search (Live Cross-Store Price & Coupon Lookup) & Category Filter Bar */}
-      <form
-        onSubmit={handleFormSubmit}
-        className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3"
-      >
-        <div className="relative flex-1">
-          <Search className="w-4 h-4 text-zinc-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Pesquisar qualquer produto nas lojas do app (ex: iPhone 15, Air Fryer, TV 55, Ryzen, JBL)..."
-            className="w-full min-h-[42px] pl-10 pr-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
-          />
-          {searchQuery && (
-            <button
-              type="button"
-              onClick={handleClearLiveSearch}
-              aria-label="Limpar busca"
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-lg text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          )}
+      <form onSubmit={handleFormSubmit} className="space-y-3">
+        {/* Row 1: Full-width spacious search input + primary submit button */}
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+          <div className="relative flex-1 min-w-0">
+            <Search className="w-4 h-4 text-zinc-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Pesquisar qualquer produto nas lojas do app (ex: iPhone 15, Air Fryer, TV 55, Ryzen, JBL)..."
+              className="w-full min-h-[46px] pl-10 pr-10 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={handleClearLiveSearch}
+                aria-label="Limpar busca"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+
+          <button
+            type="submit"
+            disabled={searching || liveSearchLoading}
+            className="min-h-[46px] px-5 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
+          >
+            <RefreshCw
+              className={`w-4 h-4 ${searching || liveSearchLoading ? 'animate-spin' : ''}`}
+            />
+            <span>
+              {liveSearchLoading
+                ? 'Buscando nas lojas...'
+                : searching
+                  ? 'Buscando ofertas...'
+                  : searchQuery.trim().length >= 2
+                    ? 'Buscar Preços e Cupons'
+                    : 'Buscar Novas Ofertas'}
+            </span>
+          </button>
         </div>
 
+        {/* Row 2: Secondary filters & quick actions */}
         <div className="flex flex-wrap items-center gap-2">
           <select
             aria-label="Filtrar por categoria"
             value={categoryFilter}
             onChange={(e) => setCategoryFilter(e.target.value)}
-            className="min-h-[42px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-700 dark:text-zinc-200"
+            className="min-h-[38px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-700 dark:text-zinc-200"
           >
             <option value="all">Todas as categorias ({categories.length})</option>
             {categories.map((cat) => (
@@ -365,7 +385,7 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
           <button
             type="button"
             onClick={() => setOnlyWithCoupon((v) => !v)}
-            className={`min-h-[42px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+            className={`min-h-[38px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
               onlyWithCoupon
                 ? 'bg-amber-500/15 dark:bg-yellow-400/15 border-amber-500/60 dark:border-yellow-400/60 text-amber-800 dark:text-yellow-300'
                 : 'border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-zinc-700 dark:text-zinc-200 hover:border-yellow-400/60'
@@ -375,41 +395,11 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
             <span>Com cupom ({activeCouponDealsCount})</span>
           </button>
 
-          <button
-            type="submit"
-            disabled={searching || liveSearchLoading}
-            className="min-h-[42px] px-4 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors whitespace-nowrap"
-          >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${searching || liveSearchLoading ? 'animate-spin' : ''}`}
-            />
-            <span>
-              {liveSearchLoading
-                ? 'Buscando nas lojas...'
-                : searching
-                  ? 'Buscando ofertas...'
-                  : searchQuery.trim().length >= 2
-                    ? 'Buscar Preços e Cupons'
-                    : 'Buscar Novas Ofertas'}
-            </span>
-          </button>
-
-          {(searchQuery.trim() || liveSearchResult) && (
-            <button
-              type="button"
-              disabled={searching || liveSearchLoading}
-              onClick={handleDiscoverFreshDeals}
-              className="min-h-[42px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-semibold text-zinc-700 dark:text-zinc-200 hover:border-yellow-400/60 transition-colors whitespace-nowrap"
-            >
-              Explorar Novidades
-            </button>
-          )}
-
           {user && (
             <button
               type="button"
               onClick={() => setOnlySaved((v) => !v)}
-              className={`min-h-[42px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+              className={`min-h-[38px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
                 onlySaved
                   ? 'bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 border-transparent'
                   : 'border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-zinc-700 dark:text-zinc-200 hover:border-yellow-400/60'
@@ -417,6 +407,17 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
             >
               <Bookmark className="w-3.5 h-3.5" />
               <span>Salvos ({savedProductCount})</span>
+            </button>
+          )}
+
+          {(searchQuery.trim() || liveSearchResult) && (
+            <button
+              type="button"
+              disabled={searching || liveSearchLoading}
+              onClick={handleDiscoverFreshDeals}
+              className="min-h-[38px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-semibold text-zinc-700 dark:text-zinc-200 hover:border-yellow-400/60 transition-colors whitespace-nowrap"
+            >
+              Explorar Novidades
             </button>
           )}
         </div>

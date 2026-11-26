@@ -1,4 +1,5 @@
 import {GoogleGenAI} from '@google/genai';
+import crypto from 'crypto';
 import express from 'express';
 import fs from 'fs';
 import http from 'http';
@@ -17,6 +18,7 @@ import type {
   FlightComparisonResult,
   FlightFareOffer,
   FlightGroundingSource,
+  FlightLegDetail,
   FlightPriceHistoryPoint,
   GroupForwardEntry,
   LiveProductStoreSearchResult,
@@ -37,12 +39,36 @@ import {
   INTERNATIONAL_DESTINATIONS,
 } from './src/data/airports.ts';
 import {buildAffiliateUrl, formatWhatsAppPromoMessage} from './src/utils/affiliate.ts';
+import {normalizePhoneE164} from './src/utils/phone.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'ofertaradar-db.json');
+const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts-db.json');
+const SESSION_SECRET_FILE = path.join(DATA_DIR, '.session-secret');
+const SESSION_COOKIE_NAME = 'ma027_session';
+function resolveSessionSecret(): string {
+  const envSecret = process.env.SESSION_SECRET?.trim();
+  if (envSecret && envSecret.length >= 16) return envSecret;
+  try {
+    if (fs.existsSync(SESSION_SECRET_FILE)) {
+      const stored = fs.readFileSync(SESSION_SECRET_FILE, 'utf-8').trim();
+      if (stored.length >= 32) return stored;
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, {recursive: true});
+    }
+    fs.writeFileSync(SESSION_SECRET_FILE, generated, {encoding: 'utf-8', mode: 0o600});
+    return generated;
+  } catch {
+    return crypto.randomBytes(32).toString('hex');
+  }
+}
+const SESSION_SECRET = resolveSessionSecret();
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 const DEAL_TTL_MS = 3 * 60 * 60 * 1000; // 3 horas exatas de validade para ofertas anunciadas
 const DEAL_PUBLISH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutos para publicar novas ofertas automaticamente
@@ -4239,9 +4265,563 @@ function refreshAffiliateLinksForStore(store: StoreConfig) {
   });
 }
 
+interface StoredLocalSavedDeal {
+  id: string;
+  userId: string;
+  dealType: 'product' | 'flight';
+  title: string;
+  storeOrAirline: string;
+  price: number;
+  affiliateUrl: string;
+  createdAt: string;
+}
+
+interface StoredLocalWhatsappSub {
+  uid: string;
+  displayName: string;
+  phoneNumber: string;
+  optIn: boolean;
+  receiveProducts: boolean;
+  receiveFlights: boolean;
+  selectedProducts: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface StoredLocalAccount {
+  uid: string;
+  authProvider: 'email' | 'phone';
+  email: string | null;
+  phoneNumber: string | null;
+  displayName: string;
+  role: 'member';
+  preferredCategories: string[];
+  passwordSalt: string;
+  passwordHash: string;
+  savedDeals: StoredLocalSavedDeal[];
+  whatsappSubscription: StoredLocalWhatsappSub | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function loadLocalAccounts(): StoredLocalAccount[] {
+  try {
+    if (fs.existsSync(ACCOUNTS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf-8')) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed as StoredLocalAccount[];
+      }
+    }
+  } catch (err) {
+    console.warn('Could not read local accounts DB:', err);
+  }
+  return [];
+}
+
+function saveLocalAccounts(accounts: StoredLocalAccount[]) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, {recursive: true});
+    }
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('Could not persist local accounts DB:', err);
+  }
+}
+
+let localAccounts: StoredLocalAccount[] = loadLocalAccounts();
+
+function hashPasswordScrypt(password: string): {salt: string; hash: string} {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return {salt, hash};
+}
+
+function verifyPasswordScrypt(password: string, salt: string, expectedHashHex: string): boolean {
+  try {
+    const derived = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(expectedHashHex, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+
+function signAccountSessionToken(uid: string): string {
+  const payloadObj = {uid, exp: Date.now() + SESSION_TTL_MS};
+  const payloadB64 = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
+  const sigB64 = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
+  return `${payloadB64}.${sigB64}`;
+}
+
+function verifyAccountSessionToken(token: string): string | null {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 2) return null;
+  const [payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) return null;
+  try {
+    const expectedSig = crypto
+      .createHmac('sha256', SESSION_SECRET)
+      .update(payloadB64)
+      .digest('base64url');
+    const a = Buffer.from(sigB64, 'utf8');
+    const b = Buffer.from(expectedSig, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+      uid?: string;
+      exp?: number;
+    };
+    if (!decoded.uid || typeof decoded.exp !== 'number' || Date.now() > decoded.exp) {
+      return null;
+    }
+    return decoded.uid;
+  } catch {
+    return null;
+  }
+}
+
+const authRateBuckets = new Map<string, number[]>();
+function isAuthRateLimited(ipKey: string): boolean {
+  const now = Date.now();
+  const windowMs = 5 * 60 * 1000;
+  const recent = (authRateBuckets.get(ipKey) || []).filter((ts) => now - ts < windowMs);
+  if (recent.length >= 20) {
+    authRateBuckets.set(ipKey, recent);
+    return true;
+  }
+  recent.push(now);
+  authRateBuckets.set(ipKey, recent);
+  return false;
+}
+
+const EMAIL_VALIDATION_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+function sanitizeAccountPayload(account: StoredLocalAccount) {
+  return {
+    user: {
+      uid: account.uid,
+      displayName: account.displayName,
+      email: account.email,
+      phoneNumber: account.phoneNumber,
+      photoURL: null,
+      authProvider: account.authProvider,
+    },
+    profile: {
+      uid: account.uid,
+      displayName: account.displayName,
+      role: 'member' as const,
+      preferredCategories: account.preferredCategories,
+    },
+    savedDeals: account.savedDeals,
+    whatsappSubscription: account.whatsappSubscription,
+    forwarderSettings: state.botConfig.whatsappGroupInviteUrl || state.botConfig.whatsappPhone
+      ? {
+          senderPhone: state.botConfig.whatsappPhone || '',
+          senderDisplayName: 'Mega Achados 027',
+          enabled: Boolean(state.botConfig.autoDispatchWhatsApp || state.botConfig.enabled),
+          welcomeMessage: '',
+          groupName: state.botConfig.whatsappGroupName || 'Grupo VIP Mega Achados 027',
+          groupInviteUrl: state.botConfig.whatsappGroupInviteUrl || '',
+          autoForwardAllDealsToGroup: state.botConfig.autoForwardAllDealsToGroup !== false,
+          updatedByUid: 'server',
+        }
+      : null,
+  };
+}
+
+function parseCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) return null;
+  const pairs = cookieHeader.split(';');
+  for (const pair of pairs) {
+    const idx = pair.indexOf('=');
+    if (idx <= 0) continue;
+    const key = pair.slice(0, idx).trim();
+    if (key === name) {
+      try {
+        return decodeURIComponent(pair.slice(idx + 1).trim());
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function isHttpsRequest(req: express.Request): boolean {
+  if (req.secure) return true;
+  const forwarded = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
+  return forwarded.split(',')[0].trim() === 'https';
+}
+
+function setSessionCookie(req: express.Request, res: express.Response, token: string) {
+  const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${maxAgeSec}`,
+    'SameSite=Lax',
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(req: express.Request, res: express.Response) {
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=0',
+    'SameSite=Lax',
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function getAuthenticatedLocalAccount(
+  req: express.Request,
+  requireCsrfHeader = false,
+): StoredLocalAccount | null {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    const token = header.slice(7).trim();
+    const uid = verifyAccountSessionToken(token);
+    if (!uid) return null;
+    return localAccounts.find((a) => a.uid === uid) || null;
+  }
+
+  const cookieToken = parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME);
+  if (!cookieToken) return null;
+  if (requireCsrfHeader && req.headers['x-requested-with'] !== 'MegaAchadosApp') {
+    return null;
+  }
+  const uid = verifyAccountSessionToken(cookieToken);
+  if (!uid) return null;
+  return localAccounts.find((a) => a.uid === uid) || null;
+}
+
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({limit: '2mb'}));
+
+  // Ensure Service Worker & entry HTML are never trapped in stale browser caches
+  app.use((req, res, next) => {
+    const p = req.path || '';
+    if (
+      p === '/sw.js' ||
+      p === '/dev-sw.js' ||
+      p === '/registerSW.js' ||
+      p === '/index.html' ||
+      p === '/'
+    ) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+    next();
+  });
+
+  // --- Local Account Auth Routes (Email + Password OR Phone-only + Password) ---
+
+  app.post('/api/auth/register', (req, res) => {
+    const ipKey = req.ip || req.socket.remoteAddress || 'unknown';
+    if (isAuthRateLimited(ipKey)) {
+      res.status(429).json({error: 'Muitas tentativas seguidas. Aguarde alguns minutos e tente novamente.'});
+      return;
+    }
+
+    const body = req.body || {};
+    const method: 'email' | 'phone' = body.method === 'phone' ? 'phone' : 'email';
+    const rawIdentifier = String(body.identifier || '').trim();
+    const rawPassword = String(body.password || '');
+    const rawName = String(body.displayName || '').trim().slice(0, 80);
+    const rawCategories: string[] = Array.isArray(body.preferredCategories)
+      ? Array.from(
+          new Set<string>(
+            (body.preferredCategories as unknown[])
+              .map((c: unknown) => String(c || '').trim().slice(0, 40))
+              .filter((c): c is string => c.length > 0),
+          ),
+        ).slice(0, 8)
+      : [];
+
+    if (rawPassword.length < 6 || rawPassword.length > 128) {
+      res.status(400).json({error: 'A senha precisa ter pelo menos 6 caracteres.'});
+      return;
+    }
+
+    let email: string | null = null;
+    let phoneNumber: string | null = null;
+
+    if (method === 'email') {
+      const normalizedEmail = rawIdentifier.toLowerCase().slice(0, 160);
+      if (!EMAIL_VALIDATION_REGEX.test(normalizedEmail)) {
+        res.status(400).json({error: 'Informe um endereço de e-mail válido.'});
+        return;
+      }
+      if (localAccounts.some((a) => a.email && a.email.toLowerCase() === normalizedEmail)) {
+        res.status(409).json({error: 'Já existe uma conta cadastrada com este e-mail. Use a aba Entrar.'});
+        return;
+      }
+      email = normalizedEmail;
+
+      const optionalPhone = String(body.whatsappPhone || '').trim();
+      if (optionalPhone) {
+        phoneNumber = normalizePhoneE164(optionalPhone);
+      }
+    } else {
+      const normalizedPhone = normalizePhoneE164(rawIdentifier);
+      if (!normalizedPhone) {
+        res.status(400).json({
+          error: 'Informe um número de celular válido com DDD (ex: (27) 99999-9999).',
+        });
+        return;
+      }
+      if (localAccounts.some((a) => a.phoneNumber === normalizedPhone)) {
+        res.status(409).json({
+          error: 'Já existe uma conta cadastrada com este número de celular. Use a aba Entrar.',
+        });
+        return;
+      }
+      phoneNumber = normalizedPhone;
+    }
+
+    const displayName =
+      rawName ||
+      (email ? email.split('@')[0].slice(0, 40) : `Membro ${phoneNumber?.slice(-4) || '027'}`);
+    const nowIso = new Date().toISOString();
+    const uid = `acc_${crypto.randomBytes(12).toString('hex')}`;
+    const {salt, hash} = hashPasswordScrypt(rawPassword);
+
+    const whatsappSubscription: StoredLocalWhatsappSub | null = phoneNumber
+      ? {
+          uid,
+          displayName,
+          phoneNumber,
+          optIn: true,
+          receiveProducts: true,
+          receiveFlights: false,
+          selectedProducts: [],
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        }
+      : null;
+
+    const newAccount: StoredLocalAccount = {
+      uid,
+      authProvider: method,
+      email,
+      phoneNumber,
+      displayName,
+      role: 'member',
+      preferredCategories: rawCategories,
+      passwordSalt: salt,
+      passwordHash: hash,
+      savedDeals: [],
+      whatsappSubscription,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    localAccounts.push(newAccount);
+    saveLocalAccounts(localAccounts);
+
+    const token = signAccountSessionToken(newAccount.uid);
+    setSessionCookie(req, res, token);
+    res.status(201).json({token, ...sanitizeAccountPayload(newAccount)});
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    const ipKey = req.ip || req.socket.remoteAddress || 'unknown';
+    if (isAuthRateLimited(ipKey)) {
+      res.status(429).json({error: 'Muitas tentativas seguidas. Aguarde alguns minutos e tente novamente.'});
+      return;
+    }
+
+    const body = req.body || {};
+    const rawIdentifier = String(body.identifier || '').trim();
+    const rawPassword = String(body.password || '');
+
+    if (!rawIdentifier || !rawPassword) {
+      res.status(400).json({error: 'Informe seu e-mail ou número de celular e sua senha.'});
+      return;
+    }
+
+    let account: StoredLocalAccount | undefined;
+    if (rawIdentifier.includes('@')) {
+      const normEmail = rawIdentifier.toLowerCase();
+      account = localAccounts.find((a) => a.email && a.email.toLowerCase() === normEmail);
+    } else {
+      const normPhone = normalizePhoneE164(rawIdentifier);
+      if (normPhone) {
+        account = localAccounts.find((a) => a.phoneNumber === normPhone);
+      }
+    }
+
+    if (!account || !verifyPasswordScrypt(rawPassword, account.passwordSalt, account.passwordHash)) {
+      res.status(401).json({error: 'E-mail/celular ou senha incorretos. Verifique e tente novamente.'});
+      return;
+    }
+
+    const token = signAccountSessionToken(account.uid);
+    setSessionCookie(req, res, token);
+    res.json({token, ...sanitizeAccountPayload(account)});
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    if (
+      !req.headers.authorization?.startsWith('Bearer ') &&
+      req.headers['x-requested-with'] !== 'MegaAchadosApp'
+    ) {
+      res.status(403).json({error: 'Requisição inválida.'});
+      return;
+    }
+    clearSessionCookie(req, res);
+    res.json({ok: true});
+  });
+
+  app.get('/api/auth/me', (req, res) => {
+    const account = getAuthenticatedLocalAccount(req, false);
+    if (!account) {
+      res.status(401).json({error: 'Sessão inválida ou expirada.'});
+      return;
+    }
+    const refreshedToken = signAccountSessionToken(account.uid);
+    res.json({token: refreshedToken, ...sanitizeAccountPayload(account)});
+  });
+
+  app.put('/api/account/profile', (req, res) => {
+    const account = getAuthenticatedLocalAccount(req, true);
+    if (!account) {
+      res.status(401).json({error: 'Sessão inválida ou expirada.'});
+      return;
+    }
+    const body = req.body || {};
+    const cleanName = String(body.displayName || '').trim().slice(0, 80);
+    if (cleanName) {
+      account.displayName = cleanName;
+      if (account.whatsappSubscription) {
+        account.whatsappSubscription.displayName = cleanName;
+        account.whatsappSubscription.updatedAt = new Date().toISOString();
+      }
+    }
+    if (Array.isArray(body.preferredCategories)) {
+      account.preferredCategories = Array.from(
+        new Set<string>(
+          (body.preferredCategories as unknown[])
+            .map((c: unknown) => String(c || '').trim().slice(0, 40))
+            .filter((c): c is string => c.length > 0),
+        ),
+      ).slice(0, 8);
+    }
+    account.updatedAt = new Date().toISOString();
+    saveLocalAccounts(localAccounts);
+    res.json(sanitizeAccountPayload(account));
+  });
+
+  app.post('/api/account/saved-deals/toggle', (req, res) => {
+    const account = getAuthenticatedLocalAccount(req, true);
+    if (!account) {
+      res.status(401).json({error: 'Sessão inválida ou expirada.'});
+      return;
+    }
+    const body = req.body || {};
+    const cleanId = String(body.id || '')
+      .replace(/[^a-zA-Z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 120);
+    if (!cleanId) {
+      res.status(400).json({error: 'Identificador da oferta inválido.'});
+      return;
+    }
+
+    const existingIdx = account.savedDeals.findIndex((d) => d.id === cleanId);
+    let saved = false;
+    if (existingIdx >= 0) {
+      account.savedDeals.splice(existingIdx, 1);
+      saved = false;
+    } else {
+      const rawUrl = String(body.affiliateUrl || '').trim().slice(0, 1200);
+      const safeUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : 'https://megaachados027.app';
+      account.savedDeals.unshift({
+        id: cleanId,
+        userId: account.uid,
+        dealType: body.dealType === 'flight' ? 'flight' : 'product',
+        title: String(body.title || 'Oferta Mega Achados 027').trim().slice(0, 180),
+        storeOrAirline: String(body.storeOrAirline || 'Loja Parceira').trim().slice(0, 80),
+        price: Math.max(0, Math.min(1000000, Number(body.price) || 0)),
+        affiliateUrl: safeUrl,
+        createdAt: new Date().toISOString(),
+      });
+      account.savedDeals = account.savedDeals.slice(0, 100);
+      saved = true;
+    }
+
+    account.updatedAt = new Date().toISOString();
+    saveLocalAccounts(localAccounts);
+    res.json({saved, savedDeals: account.savedDeals});
+  });
+
+  app.put('/api/account/whatsapp', (req, res) => {
+    const account = getAuthenticatedLocalAccount(req, true);
+    if (!account) {
+      res.status(401).json({error: 'Sessão inválida ou expirada.'});
+      return;
+    }
+    const body = req.body || {};
+    const normalizedPhone = normalizePhoneE164(String(body.phoneNumber || ''));
+    if (!normalizedPhone) {
+      res.status(400).json({
+        error: 'Informe um número de WhatsApp válido com DDD (ex: (27) 99999-9999).',
+      });
+      return;
+    }
+
+    const selectedProducts: string[] = Array.isArray(body.selectedProducts)
+      ? Array.from(
+          new Set<string>(
+            (body.selectedProducts as unknown[])
+              .map((p: unknown) => String(p || '').trim().slice(0, 80))
+              .filter((p): p is string => p.length > 0),
+          ),
+        ).slice(0, 20)
+      : account.whatsappSubscription?.selectedProducts || [];
+
+    const nowIso = new Date().toISOString();
+    account.whatsappSubscription = {
+      uid: account.uid,
+      displayName: account.displayName,
+      phoneNumber: normalizedPhone,
+      optIn: body.optIn !== false,
+      receiveProducts: body.receiveProducts !== false,
+      receiveFlights: Boolean(body.receiveFlights),
+      selectedProducts,
+      createdAt: account.whatsappSubscription?.createdAt || nowIso,
+      updatedAt: nowIso,
+    };
+    account.updatedAt = nowIso;
+    saveLocalAccounts(localAccounts);
+    res.json({whatsappSubscription: account.whatsappSubscription});
+  });
+
+  app.delete('/api/account/whatsapp', (req, res) => {
+    const account = getAuthenticatedLocalAccount(req, true);
+    if (!account) {
+      res.status(401).json({error: 'Sessão inválida ou expirada.'});
+      return;
+    }
+    account.whatsappSubscription = null;
+    account.updatedAt = new Date().toISOString();
+    saveLocalAccounts(localAccounts);
+    res.json({ok: true});
+  });
 
   // --- API Routes ---
 
@@ -5727,11 +6307,66 @@ async function startServer() {
     AIRLINE_BY_CODE.set(al.code.toUpperCase(), al);
   }
 
+  const suggestBestInternationalHub = (domestic: Airport, foreign: Airport): Airport => {
+    const findHub = (code: string) =>
+      BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === code) ||
+      BRAZILIAN_INTERNATIONAL_AIRPORTS[0];
+
+    if (domestic.hasInternationalFlights) {
+      return domestic;
+    }
+
+    const pickNearest = (codes: string[]): Airport => {
+      const candidates = codes
+        .map((c) => BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === c))
+        .filter((a): a is Airport => Boolean(a));
+      if (candidates.length === 0) return findHub('GRU');
+      return candidates.sort(
+        (a, b) => calcHaversineKm(domestic, a) - calcHaversineKm(domestic, b),
+      )[0];
+    };
+
+    if (domestic.region === 'Nordeste') {
+      if (['LIS', 'OPO', 'MAD', 'BCN', 'CDG', 'ORY'].includes(foreign.iata)) {
+        return pickNearest(['REC', 'FOR', 'SSA']);
+      }
+      if (['MIA', 'MCO', 'FLL', 'PTY'].includes(foreign.iata)) {
+        return pickNearest(['FOR', 'REC', 'BSB', 'GRU']);
+      }
+      return findHub('GRU');
+    }
+
+    if (domestic.region === 'Sul') {
+      if (foreign.region === 'América do Sul') {
+        return pickNearest(['POA', 'CWB', 'FLN', 'GRU']);
+      }
+      return findHub('GRU');
+    }
+
+    if (domestic.region === 'Centro-Oeste') {
+      if (['MIA', 'MCO', 'FLL', 'PTY', 'CUN', 'LIS', 'EZE', 'AEP', 'SCL', 'LIM', 'BOG'].includes(foreign.iata)) {
+        return findHub('BSB');
+      }
+      return findHub('GRU');
+    }
+
+    if (domestic.region === 'Norte') {
+      if (['MIA', 'FLL', 'PTY', 'LIS'].includes(foreign.iata)) {
+        return pickNearest(['MAO', 'BEL', 'BSB']);
+      }
+      return findHub('GRU');
+    }
+
+    // Sudeste (ES, MG, RJ, SP) & intercontinental default: Guarulhos (GRU) connects to all international destinations
+    return findHub('GRU');
+  };
+
   app.post('/api/flights/compare', async (req, res) => {
     const body = req.body || {};
     const scope: TravelScope = body.scope === 'international' ? 'international' : 'national';
     const originCode = String(body.originIata || (scope === 'national' ? 'VIX' : 'GRU')).toUpperCase();
     const destCode = String(body.destinationIata || (scope === 'national' ? 'GRU' : 'LIS')).toUpperCase();
+    const rawHubInput = String(body.connectionHubIata || 'auto').trim().toUpperCase();
     const rawDepartureDate = String(
       body.departureDate || new Date(Date.now() + 21 * 86400000).toISOString().slice(0, 10),
     );
@@ -5759,10 +6394,10 @@ async function startServer() {
     let destination: Airport | undefined;
 
     if (scope === 'international') {
-      const brOrigin = BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === originCode);
+      const brOrigin = BRAZILIAN_AIRPORTS.find((a) => a.iata === originCode);
       const intlDest = INTERNATIONAL_DESTINATIONS.find((a) => a.iata === destCode);
       const intlOrigin = INTERNATIONAL_DESTINATIONS.find((a) => a.iata === originCode);
-      const brDest = BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === destCode);
+      const brDest = BRAZILIAN_AIRPORTS.find((a) => a.iata === destCode);
 
       if (brOrigin && intlDest) {
         origin = brOrigin;
@@ -5780,7 +6415,7 @@ async function startServer() {
       res.status(400).json({
         error:
           scope === 'international'
-            ? 'Para voos internacionais, selecione uma rota entre um aeroporto internacional do Brasil e um destino internacional válido.'
+            ? 'Para voos internacionais, selecione uma rota entre qualquer aeroporto brasileiro e um destino internacional válido.'
             : 'Selecione aeroportos brasileiros válidos de origem e destino.',
       });
       return;
@@ -5796,7 +6431,33 @@ async function startServer() {
       return;
     }
 
-    const distanceKm = calcHaversineKm(origin, destination);
+    const brazilianEndpoint =
+      scope === 'international' ? (origin.isBrazilian ? origin : destination) : undefined;
+    const foreignEndpoint =
+      scope === 'international' ? (origin.isBrazilian ? destination : origin) : undefined;
+
+    const explicitHubCandidate =
+      scope === 'international' && rawHubInput && rawHubInput !== 'AUTO'
+        ? BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === rawHubInput)
+        : undefined;
+    const requestedHub =
+      explicitHubCandidate && brazilianEndpoint && explicitHubCandidate.iata !== brazilianEndpoint.iata
+        ? explicitHubCandidate
+        : undefined;
+
+    const needsConnectionHub =
+      scope === 'international' &&
+      Boolean(brazilianEndpoint && foreignEndpoint) &&
+      (!brazilianEndpoint!.hasInternationalFlights || Boolean(requestedHub));
+
+    let selectedHub: Airport | undefined = needsConnectionHub
+      ? requestedHub || suggestBestInternationalHub(brazilianEndpoint!, foreignEndpoint!)
+      : undefined;
+
+    const distanceKm = selectedHub
+      ? calcHaversineKm(origin, selectedHub) + calcHaversineKm(selectedHub, destination)
+      : calcHaversineKm(origin, destination);
+
     const googleFlightsAllUrl = buildGoogleFlightsTfsUrl({
       originIata: origin.iata,
       destIata: destination.iata,
@@ -5806,26 +6467,6 @@ async function startServer() {
       passengers,
       cabinClass,
     });
-
-    let liveData: LiveFlightsCachePayload;
-    try {
-      liveData = await fetchLiveGoogleFlights({
-        originIata: origin.iata,
-        destIata: destination.iata,
-        departureDate,
-        returnDate: effectiveReturnDate,
-        tripType: googleTripType,
-        passengers,
-        cabinClass,
-        forceRefresh,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Falha ao consultar tarifas ao vivo.';
-      res.status(502).json({
-        error: `Não foi possível carregar as tarifas reais agora (${msg}). Tente novamente em alguns segundos.`,
-      });
-      return;
-    }
 
     const travelStore = !avoidThirdParty
       ? state.stores.find(
@@ -5840,6 +6481,8 @@ async function startServer() {
       : undefined;
 
     const buildFlightItineraryUrls = (
+      legOriginIata: string,
+      legDestIata: string,
       carrierCode: string,
       isMultiAirline: boolean,
       knownOfficialUrl: string,
@@ -5884,10 +6527,9 @@ async function startServer() {
             : 'ECONOMY';
       const cabinMaxMilhas = cabinClass === 'Executiva' ? 'EX' : 'EC';
 
-      // Exact Google Flights protobuf itinerary URL filtered to this carrier (or all carriers for multi-airline)
       const rawUrl = buildGoogleFlightsTfsUrl({
-        originIata: origin.iata,
-        destIata: destination.iata,
+        originIata: legOriginIata,
+        destIata: legDestIata,
         departureDate,
         returnDate: effectiveReturnDate,
         tripType: googleTripType,
@@ -5896,38 +6538,37 @@ async function startServer() {
         airlineCode: isMultiAirline ? undefined : carrierCode,
       });
 
-      // Verified direct flight-options deep links on official airline portals (NOT homepages)
       let officialUrl = knownOfficialUrl || rawUrl;
       let hasDirectAirlineDeepLink = false;
 
       if (!isMultiAirline) {
         if (carrierCode === 'LA') {
-          officialUrl = `https://www.latamairlines.com/br/pt/oferta-voos?origin=${origin.iata}&outbound=${departureDate}T00%3A00%3A00.000Z&destination=${destination.iata}${
-            isRT && returnDate ? `&inbound=${returnDate}T00%3A00%3A00.000Z` : ''
+          officialUrl = `https://www.latamairlines.com/br/pt/oferta-voos?origin=${legOriginIata}&outbound=${departureDate}T00%3A00%3A00.000Z&destination=${legDestIata}${
+            isRT && effectiveReturnDate ? `&inbound=${effectiveReturnDate}T00%3A00%3A00.000Z` : ''
           }&adt=${passengers}&chd=0&inf=0&trip=${isRT ? 'RT' : 'OW'}&cabin=${cabinLatam}&redemption=false&sort=RECOMMENDED`;
           hasDirectAirlineDeepLink = true;
         } else if (carrierCode === 'G3') {
           officialUrl = `https://b2c.voegol.com.br/compra/busca-parceiros?pv=br&tipo=${
             isRT ? 'DF' : 'SO'
-          }&de=${origin.iata}&para=${destination.iata}&ida=${depDDMMYYYY}${
+          }&de=${legOriginIata}&para=${legDestIata}&ida=${depDDMMYYYY}${
             isRT && retDDMMYYYY ? `&volta=${retDDMMYYYY}` : ''
           }&ADT=${passengers}&CHD=0&INF=0`;
           hasDirectAirlineDeepLink = true;
         } else if (carrierCode === 'AD') {
-          officialUrl = `https://www.voeazul.com.br/br/pt/home/selecao-voo?c[0].ds=${origin.iata}&c[0].as=${destination.iata}&c[0].std=${encodeURIComponent(depMMDDYYYY)}${
+          officialUrl = `https://www.voeazul.com.br/br/pt/home/selecao-voo?c[0].ds=${legOriginIata}&c[0].as=${legDestIata}&c[0].std=${encodeURIComponent(depMMDDYYYY)}${
             isRT && retMMDDYYYY
-              ? `&c[1].ds=${destination.iata}&c[1].as=${origin.iata}&c[1].std=${encodeURIComponent(retMMDDYYYY)}`
+              ? `&c[1].ds=${legDestIata}&c[1].as=${legOriginIata}&c[1].std=${encodeURIComponent(retMMDDYYYY)}`
               : ''
           }&p[0].t=ADT&p[0].c=${passengers}&p[0].cp=false&f.dl=3&f.dr=3&cc=BRL`;
           hasDirectAirlineDeepLink = true;
         } else if (carrierCode === 'TP') {
-          officialUrl = `https://booking.flytap.com/booking/flights/deeplink?market=BR&language=pt&origin=${origin.iata}&destination=${destination.iata}&depDate=${depDotDate}${
+          officialUrl = `https://booking.flytap.com/booking/flights/deeplink?market=BR&language=pt&origin=${legOriginIata}&destination=${legDestIata}&depDate=${depDotDate}${
             isRT && retDotDate ? `&retDate=${retDotDate}` : ''
           }&adt=${passengers}&chd=0&inf=0&cabinClass=${cabinTap}`;
           hasDirectAirlineDeepLink = true;
         } else if (carrierCode === 'H2') {
-          officialUrl = `https://www.skyairline.com/brasil/flujo-de-compra/busqueda-de-vuelos?origin=${origin.iata}&destination=${destination.iata}&departureDate=${departureDate}${
-            isRT && returnDate ? `&returnDate=${returnDate}` : ''
+          officialUrl = `https://www.skyairline.com/brasil/flujo-de-compra/busqueda-de-vuelos?origin=${legOriginIata}&destination=${legDestIata}&departureDate=${departureDate}${
+            isRT && effectiveReturnDate ? `&returnDate=${effectiveReturnDate}` : ''
           }&adults=${passengers}`;
           hasDirectAirlineDeepLink = true;
         }
@@ -5946,34 +6587,34 @@ async function startServer() {
       }
 
       const dom = travelStore.domain.toLowerCase();
-      let partnerBaseUrl = `https://www.kayak.com.br/flights/${origin.iata}-${destination.iata}/${departureDate}${
-        isRT && returnDate ? `/${returnDate}` : ''
+      let partnerBaseUrl = `https://www.kayak.com.br/flights/${legOriginIata}-${legDestIata}/${departureDate}${
+        isRT && effectiveReturnDate ? `/${effectiveReturnDate}` : ''
       }/${cabinKayakPrefix}${passengers}adults?sort=bestflight_a${
         !isMultiAirline ? `&fs=airlines=${carrierCode}${stopsCount === 0 ? ';stops=0' : ''}` : ''
       }`;
       if (dom.includes('decolar')) {
         partnerBaseUrl = `https://www.decolar.com/shop/flights/results/${
           isRT ? 'roundtrip' : 'oneway'
-        }/${origin.iata}/${destination.iata}/${departureDate}${
-          isRT && returnDate ? `/${returnDate}` : ''
+        }/${legOriginIata}/${legDestIata}/${departureDate}${
+          isRT && effectiveReturnDate ? `/${effectiveReturnDate}` : ''
         }/${passengers}/0/0`;
       } else if (dom.includes('skyscanner')) {
-        partnerBaseUrl = `https://www.skyscanner.com.br/transporte/passagens-aereas/${origin.iata.toLowerCase()}/${destination.iata.toLowerCase()}/${depYYMMDD}/${
+        partnerBaseUrl = `https://www.skyscanner.com.br/transporte/passagens-aereas/${legOriginIata.toLowerCase()}/${legDestIata.toLowerCase()}/${depYYMMDD}/${
           isRT && retYYMMDD ? `${retYYMMDD}/` : ''
         }?adultsv2=${passengers}&cabinclass=${cabinSkyscanner}&rtn=${isRT ? '1' : '0'}${
           stopsCount === 0 ? '&preferdirects=true' : ''
         }`;
       } else if (dom.includes('booking')) {
-        partnerBaseUrl = `https://flights.booking.com/flights/${origin.iata}.AIRPORT-${destination.iata}.AIRPORT/?type=${
+        partnerBaseUrl = `https://flights.booking.com/flights/${legOriginIata}.AIRPORT-${legDestIata}.AIRPORT/?type=${
           isRT ? 'ROUNDTRIP' : 'ONEWAY'
         }&adults=${passengers}&cabinClass=${cabinBooking}&depart=${departureDate}${
-          isRT && returnDate ? `&return=${returnDate}` : ''
+          isRT && effectiveReturnDate ? `&return=${effectiveReturnDate}` : ''
         }`;
       } else if (dom.includes('maxmilhas')) {
         partnerBaseUrl = `https://www.maxmilhas.com.br/busca-passagens-aereas/${
           isRT ? 'RT' : 'OW'
-        }/${origin.iata}/${destination.iata}/${departureDate}${
-          isRT && returnDate ? `/${returnDate}` : ''
+        }/${legOriginIata}/${legDestIata}/${departureDate}${
+          isRT && effectiveReturnDate ? `/${effectiveReturnDate}` : ''
         }/${passengers}/0/0/${cabinMaxMilhas}`;
       }
 
@@ -5988,7 +6629,11 @@ async function startServer() {
 
     const fallbackColors = ['#2563EB', '#E11D48', '#EA580C', '#0284C7', '#16A34A', '#7C3AED', '#CA8A04'];
 
-    const offers: FlightFareOffer[] = liveData.flights.map((lf, idx) => {
+    const mapSingleTicketOffer = (
+      lf: LiveFlightsCachePayload['flights'][number],
+      idx: number,
+      hubTag?: Airport,
+    ): FlightFareOffer => {
       const meta =
         (scope === 'national'
           ? NATIONAL_AIRLINES.find((a) => a.code === lf.carrierCode)
@@ -6009,12 +6654,27 @@ async function startServer() {
             : `${lf.stops} paradas${lf.stopAirports.length > 0 ? ` (${lf.stopAirports.join(' / ')})` : ''}`;
 
       const {rawUrl, officialUrl, hasDirectAirlineDeepLink, partnerSearchUrl, sourceLabel} =
-        buildFlightItineraryUrls(lf.carrierCode, lf.isMultiAirline, meta?.officialUrl || '', lf.stops);
+        buildFlightItineraryUrls(
+          origin!.iata,
+          destination!.iata,
+          lf.carrierCode,
+          lf.isMultiAirline,
+          meta?.officialUrl || '',
+          lf.stops,
+        );
 
       const roundTripTotal = lf.priceBrl;
+      const matchedHubCode =
+        hubTag?.iata ||
+        lf.stopAirports.find((code) =>
+          BRAZILIAN_INTERNATIONAL_AIRPORTS.some((h) => h.iata === code.toUpperCase()),
+        );
+      const matchedHubObj = matchedHubCode
+        ? BRAZILIAN_INTERNATIONAL_AIRPORTS.find((h) => h.iata === matchedHubCode.toUpperCase())
+        : undefined;
 
       return {
-        id: `live-${lf.carrierCode}-${origin.iata}-${destination.iata}-${idx}`,
+        id: `live-${lf.carrierCode}-${origin!.iata}-${destination!.iata}-${idx}`,
         airlineCode: lf.isMultiAirline ? 'MULTI' : lf.carrierCode,
         airlineName,
         airlineAccent,
@@ -6037,10 +6697,291 @@ async function startServer() {
         officialUrl,
         hasDirectAirlineDeepLink,
         affiliatePartnerUrl: partnerSearchUrl,
-        sourceLabel,
+        sourceLabel: matchedHubObj
+          ? `Bilhete Único · Conexão em ${matchedHubObj.iata}`
+          : sourceLabel,
         isLiveVerified: true,
+        connectionHubIata: matchedHubObj?.iata,
+        connectionHubCity: matchedHubObj?.city,
+        isSplitConnection: false,
       };
-    });
+    };
+
+    const buildLegDetail = (
+      lf: LiveFlightsCachePayload['flights'][number],
+      legOrigin: Airport,
+      legDest: Airport,
+      isNationalLeg: boolean,
+    ): FlightLegDetail => {
+      const meta =
+        (isNationalLeg
+          ? NATIONAL_AIRLINES.find((a) => a.code === lf.carrierCode)
+          : INTERNATIONAL_AIRLINES.find((a) => a.code === lf.carrierCode)) ||
+        AIRLINE_BY_CODE.get(lf.carrierCode);
+      const airlineName = lf.isMultiAirline
+        ? lf.airlineNames.join(' + ')
+        : meta?.name || lf.airlineNames[0] || lf.carrierCode;
+      const airlineAccent =
+        meta?.accent || fallbackColors[hashSeed(lf.carrierCode) % fallbackColors.length];
+      const stopLabel =
+        lf.stops === 0
+          ? 'Voo direto'
+          : lf.stops === 1
+            ? `1 parada${lf.stopAirports[0] ? ` (${lf.stopAirports[0]})` : ''}`
+            : `${lf.stops} paradas${lf.stopAirports.length > 0 ? ` (${lf.stopAirports.join(' / ')})` : ''}`;
+
+      const urls = buildFlightItineraryUrls(
+        legOrigin.iata,
+        legDest.iata,
+        lf.carrierCode,
+        lf.isMultiAirline,
+        meta?.officialUrl || '',
+        lf.stops,
+      );
+
+      return {
+        originIata: legOrigin.iata,
+        originCity: legOrigin.city,
+        destinationIata: legDest.iata,
+        destinationCity: legDest.city,
+        airlineCode: lf.isMultiAirline ? 'MULTI' : lf.carrierCode,
+        airlineName,
+        airlineAccent,
+        flightNumber: lf.flightNumber,
+        departureTime: lf.departureTime,
+        arrivalTime: lf.arrivalTime,
+        durationMinutes:
+          lf.durationMinutes || Math.round((calcHaversineKm(legOrigin, legDest) / 780) * 60) + 35,
+        stops: lf.stops,
+        stopLabel,
+        priceBrl: lf.priceBrl,
+        rawUrl: urls.rawUrl,
+        officialUrl: urls.officialUrl,
+        hasDirectAirlineDeepLink: urls.hasDirectAirlineDeepLink,
+        affiliatePartnerUrl: urls.partnerSearchUrl,
+      };
+    };
+
+    let primaryLiveData: LiveFlightsCachePayload | null = null;
+    let leg1Data: LiveFlightsCachePayload | null = null;
+    let leg2Data: LiveFlightsCachePayload | null = null;
+
+    if (needsConnectionHub && selectedHub) {
+      const [directSettled, leg1Settled, leg2Settled] = await Promise.allSettled([
+        fetchLiveGoogleFlights({
+          originIata: origin.iata,
+          destIata: destination.iata,
+          departureDate,
+          returnDate: effectiveReturnDate,
+          tripType: googleTripType,
+          passengers,
+          cabinClass,
+          forceRefresh,
+        }),
+        fetchLiveGoogleFlights({
+          originIata: origin.iata,
+          destIata: selectedHub.iata,
+          departureDate,
+          returnDate: effectiveReturnDate,
+          tripType: googleTripType,
+          passengers,
+          cabinClass,
+          forceRefresh,
+        }),
+        fetchLiveGoogleFlights({
+          originIata: selectedHub.iata,
+          destIata: destination.iata,
+          departureDate,
+          returnDate: effectiveReturnDate,
+          tripType: googleTripType,
+          passengers,
+          cabinClass,
+          forceRefresh,
+        }),
+      ]);
+
+      primaryLiveData = directSettled.status === 'fulfilled' ? directSettled.value : null;
+      leg1Data = leg1Settled.status === 'fulfilled' ? leg1Settled.value : null;
+      leg2Data = leg2Settled.status === 'fulfilled' ? leg2Settled.value : null;
+
+      // In auto hub mode, if the suggested regional hub had no flights on either leg, fallback to GRU
+      if (
+        !requestedHub &&
+        selectedHub.iata !== 'GRU' &&
+        (!leg1Data?.flights.length || !leg2Data?.flights.length)
+      ) {
+        const gruHub = BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === 'GRU');
+        if (gruHub && gruHub.iata !== origin.iata && gruHub.iata !== destination.iata) {
+          const [gruLeg1, gruLeg2] = await Promise.allSettled([
+            fetchLiveGoogleFlights({
+              originIata: origin.iata,
+              destIata: gruHub.iata,
+              departureDate,
+              returnDate: effectiveReturnDate,
+              tripType: googleTripType,
+              passengers,
+              cabinClass,
+              forceRefresh,
+            }),
+            fetchLiveGoogleFlights({
+              originIata: gruHub.iata,
+              destIata: destination.iata,
+              departureDate,
+              returnDate: effectiveReturnDate,
+              tripType: googleTripType,
+              passengers,
+              cabinClass,
+              forceRefresh,
+            }),
+          ]);
+          const g1 = gruLeg1.status === 'fulfilled' ? gruLeg1.value : null;
+          const g2 = gruLeg2.status === 'fulfilled' ? gruLeg2.value : null;
+          if (g1?.flights.length && g2?.flights.length) {
+            selectedHub = gruHub;
+            leg1Data = g1;
+            leg2Data = g2;
+          }
+        }
+      }
+
+      if (!primaryLiveData && (!leg1Data || !leg2Data)) {
+        const firstErr =
+          directSettled.status === 'rejected'
+            ? directSettled.reason
+            : leg1Settled.status === 'rejected'
+              ? leg1Settled.reason
+              : leg2Settled.status === 'rejected'
+                ? leg2Settled.reason
+                : new Error('Falha ao consultar tarifas ao vivo.');
+        const msg = firstErr instanceof Error ? firstErr.message : 'Falha ao consultar tarifas ao vivo.';
+        res.status(502).json({
+          error: `Não foi possível carregar as tarifas reais agora (${msg}). Tente novamente em alguns segundos.`,
+        });
+        return;
+      }
+    } else {
+      try {
+        primaryLiveData = await fetchLiveGoogleFlights({
+          originIata: origin.iata,
+          destIata: destination.iata,
+          departureDate,
+          returnDate: effectiveReturnDate,
+          tripType: googleTripType,
+          passengers,
+          cabinClass,
+          forceRefresh,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Falha ao consultar tarifas ao vivo.';
+        res.status(502).json({
+          error: `Não foi possível carregar as tarifas reais agora (${msg}). Tente novamente em alguns segundos.`,
+        });
+        return;
+      }
+    }
+
+    let offers: FlightFareOffer[] = [];
+
+    if (primaryLiveData?.flights.length) {
+      const mappedDirect = primaryLiveData.flights.map((lf, idx) =>
+        mapSingleTicketOffer(lf, idx, requestedHub),
+      );
+      if (requestedHub) {
+        // Prioritize single-ticket itineraries that actually connect through the user's chosen Brazilian hub
+        const matchingHub = mappedDirect.filter((_, i) =>
+          primaryLiveData!.flights[i].stopAirports.some(
+            (code) => code.toUpperCase() === requestedHub.iata,
+          ),
+        );
+        offers.push(...matchingHub);
+      } else {
+        offers.push(...mappedDirect);
+      }
+    }
+
+    // Build combined 2-leg offers: Non-international BR -> International Hub BR -> Foreign Destination (or reverse)
+    if (needsConnectionHub && selectedHub && leg1Data?.flights.length && leg2Data?.flights.length) {
+      const pickTopDiverse = (
+        flights: LiveFlightsCachePayload['flights'],
+        limit: number,
+      ): LiveFlightsCachePayload['flights'] => {
+        const sorted = [...flights].sort((a, b) => a.priceBrl - b.priceBrl);
+        const picked: LiveFlightsCachePayload['flights'] = [];
+        const seenCarrier = new Set<string>();
+        for (const f of sorted) {
+          if (!seenCarrier.has(f.carrierCode)) {
+            picked.push(f);
+            seenCarrier.add(f.carrierCode);
+            if (picked.length >= limit) break;
+          }
+        }
+        if (picked.length < limit) {
+          for (const f of sorted) {
+            if (!picked.includes(f)) {
+              picked.push(f);
+              if (picked.length >= limit) break;
+            }
+          }
+        }
+        return picked;
+      };
+
+      const topLeg1 = pickTopDiverse(leg1Data.flights, 3);
+      const topLeg2 = pickTopDiverse(leg2Data.flights, 4);
+      const leg1IsNational = origin.isBrazilian && selectedHub.isBrazilian;
+      const leg2IsNational = selectedHub.isBrazilian && destination.isBrazilian;
+
+      const splitCandidates: FlightFareOffer[] = [];
+      let splitIdx = 0;
+
+      for (const f1 of topLeg1) {
+        for (const f2 of topLeg2) {
+          const d1 = buildLegDetail(f1, origin, selectedHub, leg1IsNational);
+          const d2 = buildLegDetail(f2, selectedHub, destination, leg2IsNational);
+          const combinedPrice = d1.priceBrl + d2.priceBrl;
+          const sameCarrier = d1.airlineCode === d2.airlineCode && d1.airlineCode !== 'MULTI';
+          const combinedAirlineName = sameCarrier
+            ? d1.airlineName
+            : `${d1.airlineName} + ${d2.airlineName}`;
+          const totalStops = d1.stops + d2.stops + 1;
+          const totalDuration = d1.durationMinutes + d2.durationMinutes + 150;
+
+          splitCandidates.push({
+            id: `split-${origin.iata}-${selectedHub.iata}-${destination.iata}-${splitIdx++}`,
+            airlineCode: sameCarrier ? d1.airlineCode : 'CONEX',
+            airlineName: combinedAirlineName,
+            airlineAccent: sameCarrier ? d1.airlineAccent : '#D97706',
+            flightNumber: `${d1.flightNumber} + ${d2.flightNumber}`,
+            isMultiAirline: !sameCarrier,
+            departureTime: d1.departureTime,
+            arrivalTime: d2.arrivalTime,
+            durationMinutes: totalDuration,
+            stops: totalStops,
+            stopLabel: `Conexão em ${selectedHub.iata} (${origin.iata} → ${selectedHub.iata} → ${destination.iata})`,
+            cabinClass,
+            baggageIncluded: '2 bilhetes separados · confira franquia por trecho',
+            priceCash: combinedPrice,
+            taxIncluded: 0,
+            roundTripTotal: combinedPrice,
+            milesEstimate: Math.round(combinedPrice * 22),
+            rawUrl: d2.rawUrl,
+            officialUrl: d2.officialUrl,
+            hasDirectAirlineDeepLink: d2.hasDirectAirlineDeepLink,
+            affiliatePartnerUrl: d2.affiliatePartnerUrl,
+            sourceLabel: `2 Trechos Reais · Conexão em ${selectedHub.iata}`,
+            isLiveVerified: true,
+            connectionHubIata: selectedHub.iata,
+            connectionHubCity: selectedHub.city,
+            isSplitConnection: true,
+            legs: [d1, d2],
+          });
+        }
+      }
+
+      splitCandidates.sort((a, b) => a.roundTripTotal - b.roundTripTotal);
+      const maxSplitOffers = requestedHub ? 8 : 5;
+      offers.push(...splitCandidates.slice(0, maxSplitOffers));
+    }
 
     offers.sort((a, b) => a.roundTripTotal - b.roundTripTotal);
 
@@ -6050,10 +6991,19 @@ async function startServer() {
     const avgPrice =
       totals.length > 0 ? Math.round(totals.reduce((s, v) => s + v, 0) / totals.length) : 0;
 
-    // Use real historical daily price points from Google Flights (last 30 days)
+    // Use real historical daily price points from Google Flights (prefer single-ticket history, fallback to intl leg)
+    const historySource =
+      primaryLiveData && primaryLiveData.historyPoints.length > 0
+        ? primaryLiveData
+        : leg2Data && !destination.isBrazilian && leg2Data.historyPoints.length > 0
+          ? leg2Data
+          : leg1Data && !origin.isBrazilian && leg1Data.historyPoints.length > 0
+            ? leg1Data
+            : primaryLiveData || leg2Data || leg1Data;
+
     const priceHistory: FlightPriceHistoryPoint[] = [];
-    if (liveData.historyPoints.length > 0) {
-      const recent = liveData.historyPoints.slice(-30);
+    if (historySource && historySource.historyPoints.length > 0) {
+      const recent = historySource.historyPoints.slice(-30);
       const step = recent.length > 15 ? 2 : 1;
       for (let i = 0; i < recent.length; i += step) {
         const pt = recent[i];
@@ -6061,12 +7011,11 @@ async function startServer() {
         priceHistory.push({
           date: d.toLocaleDateString('pt-BR', {day: '2-digit', month: 'short'}),
           minPrice: pt.priceBrl,
-          avgPrice: liveData.typicalPriceHigh
-            ? Math.round((pt.priceBrl + liveData.typicalPriceHigh) / 2)
+          avgPrice: historySource.typicalPriceHigh
+            ? Math.round((pt.priceBrl + historySource.typicalPriceHigh) / 2)
             : pt.priceBrl,
         });
       }
-      // Always include the very latest point synced with today's live lowest fare
       if (lowestPrice > 0) {
         const lastPt = recent[recent.length - 1];
         const lastLabel = new Date(lastPt.timestampMs).toLocaleDateString('pt-BR', {
@@ -6095,6 +7044,13 @@ async function startServer() {
       scope,
       origin,
       destination,
+      connectionHub: selectedHub,
+      connectionMode: !needsConnectionHub
+        ? 'direct_international'
+        : requestedHub
+          ? 'custom_hub'
+          : 'auto_hub',
+      recommendedHubIata: selectedHub?.iata,
       departureDate,
       returnDate:
         tripType === 'returnonly'
@@ -6109,13 +7065,13 @@ async function startServer() {
       lowestPrice,
       avgPrice,
       highestPrice,
-      typicalPriceLow: liveData.typicalPriceLow,
-      typicalPriceHigh: liveData.typicalPriceHigh,
+      typicalPriceLow: primaryLiveData?.typicalPriceLow,
+      typicalPriceHigh: primaryLiveData?.typicalPriceHigh,
       bestAirlineName: offers[0]?.airlineName || '',
       offers,
       priceHistory,
       isLiveData: true,
-      fetchedAt: liveData.fetchedAt,
+      fetchedAt: (primaryLiveData || leg1Data || leg2Data)?.fetchedAt || new Date().toISOString(),
       googleFlightsAllUrl,
     };
 
@@ -6154,10 +7110,10 @@ async function startServer() {
     let origin: Airport | undefined;
     let destination: Airport | undefined;
     if (scope === 'international') {
-      const brOrigin = BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === originCode);
+      const brOrigin = BRAZILIAN_AIRPORTS.find((a) => a.iata === originCode);
       const intlDest = INTERNATIONAL_DESTINATIONS.find((a) => a.iata === destCode);
       const intlOrigin = INTERNATIONAL_DESTINATIONS.find((a) => a.iata === originCode);
-      const brDest = BRAZILIAN_INTERNATIONAL_AIRPORTS.find((a) => a.iata === destCode);
+      const brDest = BRAZILIAN_AIRPORTS.find((a) => a.iata === destCode);
       if (brOrigin && intlDest) {
         origin = brOrigin;
         destination = intlDest;

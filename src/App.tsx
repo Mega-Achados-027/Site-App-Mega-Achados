@@ -417,9 +417,13 @@ export default function App() {
   ];
 
   const memberDisplayName = useMemo(() => {
-    const raw = profile?.displayName || user?.displayName || user?.email?.split('@')[0] || 'Conta';
+    const raw =
+      profile?.displayName ||
+      user?.displayName ||
+      user?.email?.split('@')[0] ||
+      (user?.phoneNumber ? `Membro ${user.phoneNumber.slice(-4)}` : 'Conta');
     return raw.split(' ')[0];
-  }, [profile?.displayName, user?.displayName, user?.email]);
+  }, [profile?.displayName, user?.displayName, user?.email, user?.phoneNumber]);
 
   // --- RESTRICTED PUBLIC & MEMBER STOREFRONT (PRODUCT DEALS + STORE COUPONS + TRAVEL DEALS + LOGIN/SIGNUP) ---
   if (isMemberExperience) {
@@ -1032,22 +1036,22 @@ export default function App() {
                   <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                     {/* Left Column: Monitored Products Feed */}
                     <div className="lg:col-span-5 space-y-3">
-                      <div className="flex items-center gap-2">
-                        <div className="relative flex-1">
+                      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                        <div className="relative flex-1 min-w-0">
                           <Search className="w-4 h-4 text-zinc-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                           <input
                             type="text"
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
                             placeholder="Buscar produto monitorado..."
-                            className="w-full min-h-[40px] pl-10 pr-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-sm text-zinc-900 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                            className="w-full min-h-[42px] pl-10 pr-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-sm text-zinc-900 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
                           />
                         </div>
                         <select
                           aria-label="Filtrar categoria"
                           value={categoryFilter}
                           onChange={(e) => setCategoryFilter(e.target.value)}
-                          className="min-h-[40px] px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-700 dark:text-zinc-300"
+                          className="min-h-[42px] px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-700 dark:text-zinc-300 shrink-0 sm:max-w-[160px]"
                         >
                           <option value="all">Todas</option>
                           {categories.map((cat) => (

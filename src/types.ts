@@ -282,6 +282,27 @@ export interface FlightGroundingSource {
   isOfficialAirline: boolean;
 }
 
+export interface FlightLegDetail {
+  originIata: string;
+  originCity: string;
+  destinationIata: string;
+  destinationCity: string;
+  airlineCode: string;
+  airlineName: string;
+  airlineAccent: string;
+  flightNumber: string;
+  departureTime: string;
+  arrivalTime: string;
+  durationMinutes: number;
+  stops: number;
+  stopLabel: string;
+  priceBrl: number;
+  rawUrl: string;
+  officialUrl: string;
+  hasDirectAirlineDeepLink?: boolean;
+  affiliatePartnerUrl: string;
+}
+
 export interface FlightFareOffer {
   id: string;
   airlineCode: string;
@@ -307,6 +328,10 @@ export interface FlightFareOffer {
   affiliatePartnerUrl: string;
   sourceLabel: string;
   isLiveVerified?: boolean;
+  connectionHubIata?: string;
+  connectionHubCity?: string;
+  isSplitConnection?: boolean;
+  legs?: [FlightLegDetail, FlightLegDetail];
 }
 
 export interface FlightPriceHistoryPoint {
@@ -321,6 +346,9 @@ export interface FlightComparisonResult {
   scope: TravelScope;
   origin: Airport;
   destination: Airport;
+  connectionHub?: Airport;
+  connectionMode?: 'direct_international' | 'auto_hub' | 'custom_hub';
+  recommendedHubIata?: string;
   departureDate: string;
   returnDate?: string;
   tripType: TripType;

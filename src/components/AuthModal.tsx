@@ -4,12 +4,14 @@ import {
   Bookmark,
   Check,
   ExternalLink,
+  Lock,
   LogIn,
   LogOut,
+  Mail,
   MessageCircle,
   Phone,
   Plus,
-  ShieldCheck,
+  Smartphone,
   Trash2,
   Unlink,
   UserCheck,
@@ -66,12 +68,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     isAdmin,
     authBusy,
     authError,
+    authErrorCode,
+    authErrorSource,
     savedDeals,
     forwarderSettings,
     whatsappSubscription,
     clearAuthError,
     signInWithGoogle,
     signInWithGoogleRedirect,
+    registerWithCredentials,
+    loginWithCredentials,
     updateUserProfile,
     toggleSaveDeal,
     saveWhatsappSubscription,
@@ -80,8 +86,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   } = useAuth();
 
   const [mode, setMode] = useState<'login' | 'signup'>(initialMode);
+  const [signupMethod, setSignupMethod] = useState<'phone' | 'email'>('phone');
+  const [loginIdentifier, setLoginIdentifier] = useState<string>('');
+  const [loginPassword, setLoginPassword] = useState<string>('');
+
+  const [signupIdentifier, setSignupIdentifier] = useState<string>('');
+  const [signupPassword, setSignupPassword] = useState<string>('');
   const [displayName, setDisplayName] = useState<string>(profile?.displayName || '');
-  const [signupPhone, setSignupPhone] = useState<string>('');
+  const [signupPhoneOptional, setSignupPhoneOptional] = useState<string>('');
   const [selectedCategories, setSelectedCategories] = useState<string[]>(
     profile?.preferredCategories?.length ? profile.preferredCategories : ['Smartphones', 'Voos Nacionais'],
   );
@@ -170,20 +182,37 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     );
   };
 
-  const handleLogin = async () => {
-    const ok = await signInWithGoogle();
+  const handleGoogleLogin = async () => {
+    const ok = await signInWithGoogle(
+      mode === 'signup'
+        ? {
+            displayName: displayName.trim().slice(0, 80) || undefined,
+            preferredCategories: selectedCategories,
+            whatsappPhone:
+              signupMethod === 'phone'
+                ? normalizePhoneE164(signupIdentifier) || undefined
+                : normalizePhoneE164(signupPhoneOptional) || undefined,
+          }
+        : undefined,
+    );
     if (ok) onClose();
   };
 
-  const handleSignup = async (e: React.FormEvent) => {
+  const handleCredentialLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    const trimmed = displayName.trim().slice(0, 80);
-    const trimmedPhone = signupPhone.trim();
-    const normalizedSignupPhone = trimmedPhone ? normalizePhoneE164(trimmedPhone) : null;
-    const ok = await signInWithGoogle({
-      displayName: trimmed || undefined,
+    const ok = await loginWithCredentials(loginIdentifier.trim(), loginPassword);
+    if (ok) onClose();
+  };
+
+  const handleCredentialSignup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const ok = await registerWithCredentials({
+      method: signupMethod,
+      identifier: signupIdentifier.trim(),
+      password: signupPassword,
+      displayName: displayName.trim().slice(0, 80) || undefined,
       preferredCategories: selectedCategories,
-      whatsappPhone: normalizedSignupPhone || undefined,
+      whatsappPhone: signupMethod === 'email' ? signupPhoneOptional.trim() || undefined : undefined,
     });
     if (ok) onClose();
   };
@@ -215,7 +244,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       return;
     }
 
-    // Include any pending text typed in the product input box automatically
     const pendingTerm = newProductInput.trim().slice(0, 80);
     const finalProducts = pendingTerm
       ? selectedPrivateProducts.some((p) => p.toLowerCase() === pendingTerm.toLowerCase())
@@ -283,6 +311,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const senderReady = Boolean(forwarderSettings?.senderPhone && forwarderSettings.enabled);
   const officialGroupUrl = forwarderSettings?.groupInviteUrl?.trim() || '';
   const officialGroupName = forwarderSettings?.groupName?.trim() || 'Grupo VIP Mega Achados 027';
+  const isInIframe = typeof window !== 'undefined' && window.self !== window.top;
 
   return (
     <div
@@ -309,7 +338,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   ? isAdmin
                     ? 'Conta Administrador (acesso completo ao painel)'
                     : 'Grupo oficial de ofertas + alertas privados sob medida'
-                  : 'Entre ou crie sua conta para salvar ofertas e configurar alertas no WhatsApp'}
+                  : 'Entre com celular, e-mail ou Google para salvar ofertas e alertas'}
               </p>
             </div>
           </div>
@@ -325,7 +354,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
         {/* Body */}
         {!user ? (
-          <div className="p-6 space-y-5">
+          <div className="p-6 space-y-4 max-h-[82vh] overflow-y-auto">
             {/* Mode Switch Tabs: Entrar | Criar Conta */}
             <div
               role="tablist"
@@ -368,32 +397,99 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </div>
 
             {mode === 'login' ? (
-              <div className="space-y-4">
-                <div className="rounded-xl bg-zinc-50 dark:bg-[#0B0C10] border border-zinc-200 dark:border-zinc-800 p-4 space-y-2 text-xs text-zinc-600 dark:text-zinc-300 leading-relaxed">
-                  <p className="font-semibold text-zinc-950 dark:text-white flex items-center gap-2">
-                    <ShieldCheck className="w-4 h-4 text-amber-600 dark:text-yellow-400 shrink-0" />
-                    <span>Login seguro em 1 clique</span>
-                  </p>
-                  <p>
-                    Entre no nosso Grupo Oficial do WhatsApp para receber todas as promoções do site, ou escolha produtos específicos na sua conta para receber alertas só deles no privado.
-                  </p>
+              <form onSubmit={handleCredentialLogin} className="space-y-3.5">
+                <div>
+                  <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5">
+                    Celular (WhatsApp) ou E-mail
+                  </label>
+                  <div className="relative">
+                    <Smartphone className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      required
+                      autoComplete="username"
+                      value={loginIdentifier}
+                      onChange={(e) => setLoginIdentifier(e.target.value)}
+                      placeholder="Ex: (27) 99999-9999 ou seu@email.com"
+                      className="w-full min-h-[42px] pl-9 pr-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5">
+                    Senha
+                  </label>
+                  <div className="relative">
+                    <Lock className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      autoComplete="current-password"
+                      value={loginPassword}
+                      onChange={(e) => setLoginPassword(e.target.value)}
+                      placeholder="Sua senha"
+                      className="w-full min-h-[42px] pl-9 pr-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                    />
+                  </div>
                 </div>
 
                 <button
-                  type="button"
+                  type="submit"
                   disabled={authBusy}
-                  onClick={() => void handleLogin()}
-                  className="w-full min-h-[46px] px-4 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold inline-flex items-center justify-center gap-2.5 transition-colors"
+                  className="w-full min-h-[44px] px-4 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors"
                 >
                   <LogIn className="w-4 h-4" />
-                  <span>{authBusy ? 'Conectando...' : 'Entrar com Google'}</span>
+                  <span>{authBusy ? 'Entrando...' : 'Entrar na Conta'}</span>
                 </button>
-              </div>
+              </form>
             ) : (
-              <form onSubmit={handleSignup} className="space-y-4">
+              <form onSubmit={handleCredentialSignup} className="space-y-3.5">
+                {/* Choose Phone-Only OR Email */}
                 <div>
                   <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5">
-                    Como você quer ser chamado?
+                    Como prefere criar sua conta?
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSignupMethod('phone');
+                        setSignupIdentifier('');
+                        clearAuthError();
+                      }}
+                      className={`min-h-[38px] px-3 rounded-xl border text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors ${
+                        signupMethod === 'phone'
+                          ? 'bg-emerald-600/15 border-emerald-500/50 text-emerald-700 dark:text-emerald-300'
+                          : 'border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-zinc-400'
+                      }`}
+                    >
+                      <Phone className="w-3.5 h-3.5" />
+                      <span>Apenas Celular</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSignupMethod('email');
+                        setSignupIdentifier('');
+                        clearAuthError();
+                      }}
+                      className={`min-h-[38px] px-3 rounded-xl border text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors ${
+                        signupMethod === 'email'
+                          ? 'bg-amber-500/15 border-amber-500/50 text-amber-700 dark:text-yellow-300'
+                          : 'border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-zinc-400'
+                      }`}
+                    >
+                      <Mail className="w-3.5 h-3.5" />
+                      <span>Usar E-mail</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Seu nome
                   </label>
                   <input
                     type="text"
@@ -401,36 +497,96 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
                     placeholder="Ex: João Silva"
-                    className="w-full min-h-[42px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                    className="w-full min-h-[40px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
                   />
                 </div>
 
+                {signupMethod === 'phone' ? (
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                      Número do celular / WhatsApp (com DDD)
+                    </label>
+                    <div className="relative">
+                      <Phone className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="tel"
+                        required
+                        autoComplete="tel"
+                        value={signupIdentifier}
+                        onChange={(e) => setSignupIdentifier(e.target.value)}
+                        placeholder="Ex: (27) 99999-9999"
+                        className="w-full min-h-[40px] pl-9 pr-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm font-mono-num text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                      />
+                    </div>
+                    <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                      Não precisa de e-mail nem Google — seu celular já fica pronto para alertas privados.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                        Seu e-mail
+                      </label>
+                      <div className="relative">
+                        <Mail className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                        <input
+                          type="email"
+                          required
+                          autoComplete="email"
+                          value={signupIdentifier}
+                          onChange={(e) => setSignupIdentifier(e.target.value)}
+                          placeholder="Ex: voce@email.com"
+                          className="w-full min-h-[40px] pl-9 pr-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                        WhatsApp para alertas privados (opcional)
+                      </label>
+                      <input
+                        type="tel"
+                        value={signupPhoneOptional}
+                        onChange={(e) => setSignupPhoneOptional(e.target.value)}
+                        placeholder="Ex: (27) 99999-9999"
+                        className="w-full min-h-[40px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm font-mono-num text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                      />
+                    </div>
+                  </>
+                )}
+
                 <div>
-                  <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1.5">
-                    Seu WhatsApp para alertas privados (opcional)
+                  <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Crie uma senha (mínimo 6 caracteres)
                   </label>
-                  <input
-                    type="tel"
-                    value={signupPhone}
-                    onChange={(e) => setSignupPhone(e.target.value)}
-                    placeholder="Ex: (27) 99999-9999"
-                    className="w-full min-h-[42px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm font-mono-num text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
-                  />
-                  <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
-                    No privado você só recebe os produtos que escolher em Minha Conta.
-                  </p>
+                  <div className="relative">
+                    <Lock className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      maxLength={128}
+                      autoComplete="new-password"
+                      value={signupPassword}
+                      onChange={(e) => setSignupPassword(e.target.value)}
+                      placeholder="Mínimo 6 caracteres"
+                      className="w-full min-h-[40px] pl-9 pr-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] text-sm text-zinc-950 dark:text-white placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-red-600 dark:focus:ring-yellow-400"
+                    />
+                  </div>
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center justify-between mb-1">
                     <label className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
-                      Quais promoções mais te interessam?
+                      Interesses (opcional)
                     </label>
                     <span className="text-[11px] text-zinc-500 dark:text-zinc-400 font-mono-num">
                       {selectedCategories.length}/8
                     </span>
                   </div>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap gap-1.5">
                     {DEAL_CATEGORIES.map((cat) => {
                       const active = selectedCategories.includes(cat);
                       return (
@@ -438,7 +594,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                           key={cat}
                           type="button"
                           onClick={() => toggleCategory(cat)}
-                          className={`min-h-[34px] px-3 rounded-lg text-xs font-medium border transition-colors ${
+                          className={`min-h-[30px] px-2.5 rounded-lg text-[11px] font-medium border transition-colors ${
                             active
                               ? 'bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 border-transparent font-semibold'
                               : 'border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-zinc-400'
@@ -454,54 +610,85 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <button
                   type="submit"
                   disabled={authBusy}
-                  className="w-full min-h-[46px] px-4 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold inline-flex items-center justify-center gap-2.5 transition-colors"
+                  className="w-full min-h-[44px] px-4 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors"
                 >
                   <UserPlus className="w-4 h-4" />
-                  <span>{authBusy ? 'Criando conta...' : 'Criar Conta Grátis com Google'}</span>
+                  <span>
+                    {authBusy
+                      ? 'Criando conta...'
+                      : signupMethod === 'phone'
+                        ? 'Criar Conta com Celular'
+                        : 'Criar Conta com E-mail'}
+                  </span>
                 </button>
               </form>
             )}
+
+            {/* Divider + Google Sign-In */}
+            <div className="relative py-1">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-zinc-200 dark:border-zinc-800" />
+              </div>
+              <div className="relative flex justify-center">
+                <span className="px-3 bg-white dark:bg-[#13141A] text-[11px] font-medium text-zinc-400">
+                  ou continue com Google
+                </span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={authBusy}
+              onClick={() => void handleGoogleLogin()}
+              className="w-full min-h-[42px] px-4 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#0B0C10] hover:bg-zinc-100 dark:hover:bg-zinc-900 disabled:opacity-60 text-zinc-900 dark:text-white text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors"
+            >
+              <LogIn className="w-3.5 h-3.5 text-red-500 dark:text-yellow-400" />
+              <span>{authBusy ? 'Conectando...' : 'Entrar com Google'}</span>
+            </button>
 
             {authError && (
               <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 space-y-2.5 text-center">
                 <p className="text-xs font-medium text-red-600 dark:text-red-400 leading-relaxed">
                   {authError}
                 </p>
-                <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-0.5">
-                  {typeof window !== 'undefined' && window.self !== window.top ? (
-                    <a
-                      href={window.location.href}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="w-full sm:w-auto min-h-[36px] px-3.5 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 transition-opacity"
-                    >
-                      <span>Abrir em nova aba para entrar</span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={authBusy}
-                      onClick={() =>
-                        void signInWithGoogleRedirect(
-                          mode === 'signup'
-                            ? {
-                                displayName: displayName.trim().slice(0, 80) || undefined,
-                                preferredCategories: selectedCategories,
-                                whatsappPhone: signupPhone.trim()
-                                  ? normalizePhoneE164(signupPhone.trim()) || undefined
-                                  : undefined,
-                              }
-                            : undefined,
-                        )
-                      }
-                      className="w-full sm:w-auto min-h-[36px] px-3.5 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-60 transition-opacity"
-                    >
-                      <LogIn className="w-3.5 h-3.5" />
-                      <span>Tentar login sem popup</span>
-                    </button>
-                  )}
-                </div>
+                {authErrorSource === 'google' && (
+                  <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-0.5">
+                    {authErrorCode === 'auth/unauthorized-domain' ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMode('signup');
+                          setSignupMethod('phone');
+                          clearAuthError();
+                        }}
+                        className="w-full sm:w-auto min-h-[34px] px-3 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 transition-opacity"
+                      >
+                        <Phone className="w-3.5 h-3.5" />
+                        <span>Criar conta com Celular ou E-mail</span>
+                      </button>
+                    ) : isInIframe ? (
+                      <a
+                        href={window.location.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="w-full sm:w-auto min-h-[34px] px-3 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 transition-opacity"
+                      >
+                        <span>Abrir em nova aba (Google)</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={authBusy}
+                        onClick={() => void signInWithGoogleRedirect()}
+                        className="w-full sm:w-auto min-h-[34px] px-3 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-60 transition-opacity"
+                      >
+                        <LogIn className="w-3.5 h-3.5" />
+                        <span>Tentar Google sem popup</span>
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -519,14 +706,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   />
                 ) : (
                   <div className="w-11 h-11 rounded-full bg-yellow-400 text-zinc-950 font-bold text-sm flex items-center justify-center shrink-0">
-                    {(profile?.displayName || user.email || 'M').slice(0, 2).toUpperCase()}
+                    {(profile?.displayName || user.email || user.phoneNumber || 'M')
+                      .slice(0, 2)
+                      .toUpperCase()}
                   </div>
                 )}
                 <div className="min-w-0">
                   <p className="text-sm font-bold text-zinc-950 dark:text-white truncate">
                     {profile?.displayName || user.displayName || 'Membro Mega 027'}
                   </p>
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{user.email}</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">
+                    {user.email || (user.phoneNumber ? formatPhoneDisplay(user.phoneNumber) : 'Conta ativa')}
+                  </p>
                 </div>
               </div>
               <span
@@ -601,7 +792,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 )}
               </div>
 
-              {/* Official Forwarder Number Banner */}
               {forwarderSettings?.senderPhone && (
                 <div className="rounded-lg bg-white/80 dark:bg-[#0B0C10] border border-zinc-200 dark:border-zinc-800 px-3 py-2 flex items-center justify-between gap-2 text-[11px]">
                   <div className="min-w-0">
@@ -667,7 +857,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   </button>
                 </div>
 
-                {/* Selected Product Chips */}
                 {selectedPrivateProducts.length > 0 ? (
                   <div className="flex flex-wrap gap-1.5 pt-0.5">
                     {selectedPrivateProducts.map((item) => (
@@ -693,7 +882,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   </p>
                 )}
 
-                {/* Quick Suggestions */}
                 <div className="flex flex-wrap gap-1.5">
                   {productSuggestions
                     .filter(
@@ -717,7 +905,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 </div>
               </div>
 
-              {/* Delivery Preferences */}
               <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-700 dark:text-zinc-300 pt-1">
                 <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input

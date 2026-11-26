@@ -58,6 +58,7 @@ interface AirportComboboxProps {
   selectedIata: string;
   onSelect: (iata: string) => void;
   helperText?: string;
+  showInternationalTag?: boolean;
 }
 
 const AirportCombobox: React.FC<AirportComboboxProps> = ({
@@ -66,6 +67,7 @@ const AirportCombobox: React.FC<AirportComboboxProps> = ({
   selectedIata,
   onSelect,
   helperText,
+  showInternationalTag = false,
 }) => {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -172,9 +174,22 @@ const AirportCombobox: React.FC<AirportComboboxProps> = ({
                         {airport.name}
                       </p>
                     </div>
-                    <span className="font-mono-num text-xs font-bold text-amber-700 dark:text-yellow-400 shrink-0">
-                      {airport.iata}
-                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {showInternationalTag && airport.isBrazilian && (
+                        <span
+                          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-md ${
+                            airport.hasInternationalFlights
+                              ? 'bg-amber-500/15 text-amber-700 dark:text-yellow-400'
+                              : 'bg-zinc-200/80 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'
+                          }`}
+                        >
+                          {airport.hasInternationalFlights ? 'Internacional' : 'Via conexão BR'}
+                        </span>
+                      )}
+                      <span className="font-mono-num text-xs font-bold text-amber-700 dark:text-yellow-400">
+                        {airport.iata}
+                      </span>
+                    </div>
                   </button>
                 );
               })
@@ -204,11 +219,12 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
   const [scope, setScope] = useState<TravelScope>(initialScope);
   const [intlDirection, setIntlDirection] = useState<'br_to_intl' | 'intl_to_br'>('br_to_intl');
   const [originIata, setOriginIata] = useState<string>(
-    initialScope === 'international' ? 'GRU' : 'VIX',
+    initialScope === 'international' ? 'VIX' : 'VIX',
   );
   const [destIata, setDestIata] = useState<string>(
     initialScope === 'international' ? 'LIS' : 'GRU',
   );
+  const [connectionHubIata, setConnectionHubIata] = useState<string>('auto');
   const [regionFilter, setRegionFilter] = useState<string>('all');
 
   const [tripType, setTripType] = useState<TripType>('roundtrip');
@@ -225,6 +241,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
 
   const [sortBy, setSortBy] = useState<'price' | 'duration' | 'stops'>('price');
   const [directOnly, setDirectOnly] = useState<boolean>(false);
+  const [ticketModeFilter, setTicketModeFilter] = useState<'all' | 'single' | 'split'>('all');
   const [airlineFilter, setAirlineFilter] = useState<string>('all');
   const [avoidThirdParty, setAvoidThirdParty] = useState<boolean>(true);
 
@@ -242,17 +259,31 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
 
   const originPool = useMemo(() => {
     if (scope === 'national') return BRAZILIAN_AIRPORTS;
-    return intlDirection === 'br_to_intl'
-      ? BRAZILIAN_INTERNATIONAL_AIRPORTS
-      : filteredIntlAirports;
+    return intlDirection === 'br_to_intl' ? BRAZILIAN_AIRPORTS : filteredIntlAirports;
   }, [scope, intlDirection, filteredIntlAirports]);
 
   const destPool = useMemo(() => {
     if (scope === 'national') return BRAZILIAN_AIRPORTS;
-    return intlDirection === 'br_to_intl'
-      ? filteredIntlAirports
-      : BRAZILIAN_INTERNATIONAL_AIRPORTS;
+    return intlDirection === 'br_to_intl' ? filteredIntlAirports : BRAZILIAN_AIRPORTS;
   }, [scope, intlDirection, filteredIntlAirports]);
+
+  const selectedBrazilianAirport = useMemo(() => {
+    if (scope !== 'international') return null;
+    const code = intlDirection === 'br_to_intl' ? originIata : destIata;
+    return BRAZILIAN_AIRPORTS.find((a) => a.iata === code) || null;
+  }, [scope, intlDirection, originIata, destIata]);
+
+  const isNonInternationalOrigin = Boolean(
+    scope === 'international' &&
+      selectedBrazilianAirport &&
+      !selectedBrazilianAirport.hasInternationalFlights,
+  );
+
+  const availableConnectionHubs = useMemo(() => {
+    return BRAZILIAN_INTERNATIONAL_AIRPORTS.filter(
+      (h) => h.iata !== selectedBrazilianAirport?.iata,
+    );
+  }, [selectedBrazilianAirport]);
 
   const internationalRegions = useMemo(() => {
     const set = new Set<string>();
@@ -264,6 +295,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
     nextScope?: TravelScope;
     nextOrigin?: string;
     nextDest?: string;
+    nextConnectionHub?: string;
     nextTripType?: TripType;
     nextAvoidThirdParty?: boolean;
     forceRefresh?: boolean;
@@ -271,6 +303,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
     const s = params?.nextScope ?? scope;
     const orig = params?.nextOrigin ?? originIata;
     const dest = params?.nextDest ?? destIata;
+    const hub = params?.nextConnectionHub ?? connectionHubIata;
     const tType = params?.nextTripType ?? tripType;
     const avoid = params?.nextAvoidThirdParty ?? avoidThirdParty;
     const forceRefresh = params?.forceRefresh === true;
@@ -279,6 +312,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
     setError(null);
     setAlertSavedMsg(null);
     setAirlineFilter('all');
+    setTicketModeFilter('all');
     try {
       const resp = await fetch('/api/flights/compare', {
         method: 'POST',
@@ -287,6 +321,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
           scope: s,
           originIata: orig,
           destinationIata: dest,
+          connectionHubIata: s === 'international' ? hub : undefined,
           departureDate: tType === 'returnonly' ? returnDate : departureDate,
           returnDate: tType === 'roundtrip' || tType === 'returnonly' ? returnDate : undefined,
           tripType: tType,
@@ -324,34 +359,38 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
       onScopeChange?.(nextScope);
     }
     setDirectOnly(false);
+    setTicketModeFilter('all');
     setRegionFilter('all');
+    setConnectionHubIata('auto');
     const isReturnOnly = tripType === 'returnonly';
 
     if (nextScope === 'international') {
       if (isReturnOnly) {
         setIntlDirection('intl_to_br');
         const nextOrigin = 'LIS';
-        const nextDest = 'GRU';
+        const nextDest = BRAZILIAN_AIRPORTS.some((a) => a.iata === originIata) ? originIata : 'VIX';
         setOriginIata(nextOrigin);
         setDestIata(nextDest);
         void runSearch({
           nextScope,
           nextOrigin,
           nextDest,
+          nextConnectionHub: 'auto',
           nextTripType: tripType,
         });
       } else {
         setIntlDirection('br_to_intl');
-        const validIntlOrigin = BRAZILIAN_INTERNATIONAL_AIRPORTS.some((a) => a.iata === originIata)
+        const validBrOrigin = BRAZILIAN_AIRPORTS.some((a) => a.iata === originIata)
           ? originIata
-          : 'GRU';
+          : 'VIX';
         const defaultDest = 'LIS';
-        setOriginIata(validIntlOrigin);
+        setOriginIata(validBrOrigin);
         setDestIata(defaultDest);
         void runSearch({
           nextScope,
-          nextOrigin: validIntlOrigin,
+          nextOrigin: validBrOrigin,
           nextDest: defaultDest,
+          nextConnectionHub: 'auto',
           nextTripType: tripType,
         });
       }
@@ -360,7 +399,13 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
       const nextDest = isReturnOnly ? 'VIX' : 'GRU';
       setOriginIata(nextOrigin);
       setDestIata(nextDest);
-      void runSearch({nextScope, nextOrigin, nextDest, nextTripType: tripType});
+      void runSearch({
+        nextScope,
+        nextOrigin,
+        nextDest,
+        nextConnectionHub: 'auto',
+        nextTripType: tripType,
+      });
     }
   };
 
@@ -413,11 +458,25 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
     return Array.from(map.entries()).map(([name, code]) => ({name, code}));
   }, [result]);
 
+  const hasSplitOffers = useMemo(
+    () => Boolean(result?.offers.some((o) => o.isSplitConnection)),
+    [result],
+  );
+  const hasSingleTicketOffers = useMemo(
+    () => Boolean(result?.offers.some((o) => !o.isSplitConnection)),
+    [result],
+  );
+
   const displayedOffers = useMemo(() => {
     if (!result) return [];
     let list = [...result.offers];
     if (directOnly) {
       list = list.filter((o) => o.stops === 0);
+    }
+    if (ticketModeFilter === 'single') {
+      list = list.filter((o) => !o.isSplitConnection);
+    } else if (ticketModeFilter === 'split') {
+      list = list.filter((o) => Boolean(o.isSplitConnection));
     }
     if (airlineFilter !== 'all') {
       list = list.filter((o) => o.airlineName === airlineFilter);
@@ -428,7 +487,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
       return a.roundTripTotal - b.roundTripTotal;
     });
     return list;
-  }, [result, directOnly, airlineFilter, sortBy]);
+  }, [result, directOnly, ticketModeFilter, airlineFilter, sortBy]);
 
   const getBestDirectBookingUrl = (offer: FlightFareOffer) => {
     if (!avoidThirdParty && offer.affiliatePartnerUrl) {
@@ -539,7 +598,7 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
           >
             <Globe className="w-3.5 h-3.5 shrink-0" />
             <span>
-              Voos Internacionais ({BRAZILIAN_INTERNATIONAL_AIRPORTS.length} BR)
+              Voos Internacionais ({BRAZILIAN_AIRPORTS.length} BR)
             </span>
           </button>
         </div>
@@ -614,8 +673,8 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
                 ? 'Modo Só volta: escolha de onde está voltando, para onde retorna e a data de volta.'
                 : `Cobertura completa: todos os ${BRAZILIAN_AIRPORTS.length} aeroportos comerciais do Brasil (26 estados + DF).`
               : intlDirection === 'intl_to_br'
-                ? `Retorno internacional: exterior para um dos ${BRAZILIAN_INTERNATIONAL_AIRPORTS.length} aeroportos internacionais do Brasil.`
-                : `Voos internacionais saindo dos ${BRAZILIAN_INTERNATIONAL_AIRPORTS.length} aeroportos brasileiros com operação internacional.`}
+                ? 'Retorno internacional para qualquer aeroporto brasileiro (com conexão automática em hub internacional do Brasil quando necessário).'
+                : 'Saia de qualquer aeroporto do Brasil — aeroportos nacionais conectam automaticamente via um aeroporto internacional brasileiro até o destino final.'}
           </p>
         </div>
 
@@ -637,15 +696,19 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
               helperText={
                 scope === 'international'
                   ? intlDirection === 'br_to_intl'
-                    ? 'Internacionais do BR'
+                    ? 'Nacionais e Internacionais'
                     : 'Aeroportos no exterior'
                   : 'Todos os aeroportos do BR'
               }
+              showInternationalTag={scope === 'international' && intlDirection === 'br_to_intl'}
               airports={originPool}
               selectedIata={originIata}
               onSelect={(iata) => {
                 setOriginIata(iata);
-                void runSearch({nextOrigin: iata});
+                const nextHub = connectionHubIata === iata ? 'auto' : connectionHubIata;
+                if (nextHub !== connectionHubIata) setConnectionHubIata(nextHub);
+                setDirectOnly(false);
+                void runSearch({nextOrigin: iata, nextConnectionHub: nextHub});
               }}
             />
           </div>
@@ -679,18 +742,118 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
                 scope === 'international'
                   ? intlDirection === 'br_to_intl'
                     ? 'Destinos globais'
-                    : 'Internacionais do BR'
+                    : 'Nacionais e Internacionais'
                   : 'Todos os aeroportos do BR'
               }
+              showInternationalTag={scope === 'international' && intlDirection === 'intl_to_br'}
               airports={destPool}
               selectedIata={destIata}
               onSelect={(iata) => {
                 setDestIata(iata);
-                void runSearch({nextDest: iata});
+                const nextHub = connectionHubIata === iata ? 'auto' : connectionHubIata;
+                if (nextHub !== connectionHubIata) setConnectionHubIata(nextHub);
+                setDirectOnly(false);
+                void runSearch({nextDest: iata, nextConnectionHub: nextHub});
               }}
             />
           </div>
         </div>
+
+        {/* Brazilian International Hub Connection Selector (Non-international -> International BR -> Final Destination) */}
+        {scope === 'international' && (
+          <div
+            className={`rounded-xl border p-3.5 space-y-2.5 ${
+              isNonInternationalOrigin
+                ? 'border-amber-400/50 bg-amber-50/60 dark:bg-yellow-400/[0.06]'
+                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#0B0C10]'
+            }`}
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="space-y-0.5">
+                <p className="text-xs font-semibold text-zinc-950 dark:text-white flex items-center gap-1.5">
+                  <Plane className="w-3.5 h-3.5 text-amber-600 dark:text-yellow-400 shrink-0" />
+                  <span>
+                    {isNonInternationalOrigin
+                      ? `Conexão em Aeroporto Internacional do Brasil (${
+                          intlDirection === 'br_to_intl'
+                            ? `${originIata} → Hub BR → ${destIata}`
+                            : `${originIata} → Hub BR → ${destIata}`
+                        })`
+                      : 'Conexão opcional em outro Aeroporto Internacional do Brasil'}
+                  </span>
+                </p>
+                <p className="text-[11px] text-zinc-600 dark:text-zinc-400">
+                  {isNonInternationalOrigin && selectedBrazilianAirport
+                    ? `${selectedBrazilianAirport.city} (${selectedBrazilianAirport.iata}) não opera voos internacionais diretos. Escolha abaixo qual aeroporto internacional do Brasil usar como ponte (comparamos bilhete único + 2 trechos combinados).`
+                    : 'Por padrão buscamos direto do aeroporto escolhido, mas você pode forçar conexão por outro hub internacional brasileiro (ex: GRU, GIG, VCP, CNF).'}
+                </p>
+              </div>
+
+              <select
+                aria-label="Escolher aeroporto internacional de conexão no Brasil"
+                value={connectionHubIata}
+                onChange={(e) => {
+                  const nextHub = e.target.value;
+                  setConnectionHubIata(nextHub);
+                  void runSearch({nextConnectionHub: nextHub});
+                }}
+                className="min-h-[36px] px-3 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-800 dark:text-zinc-100 shrink-0"
+              >
+                <option value="auto">
+                  {isNonInternationalOrigin
+                    ? 'Automático (melhor hub internacional)'
+                    : 'Sem conexão obrigatória (padrão)'}
+                </option>
+                {availableConnectionHubs.map((hub) => (
+                  <option key={hub.iata} value={hub.iata}>
+                    Via {hub.iata} · {hub.city} ({hub.stateOrCountry})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setConnectionHubIata('auto');
+                  void runSearch({nextConnectionHub: 'auto'});
+                }}
+                className={`min-h-[30px] px-2.5 rounded-lg text-[11px] font-semibold border transition-colors ${
+                  connectionHubIata === 'auto'
+                    ? 'bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 border-transparent'
+                    : 'border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#13141A] text-zinc-600 dark:text-zinc-300 hover:border-zinc-400'
+                }`}
+              >
+                {isNonInternationalOrigin ? 'Automático' : 'Padrão'}
+              </button>
+              {['GRU', 'GIG', 'VCP', 'CNF', 'BSB', 'REC', 'POA']
+                .filter((code) => code !== selectedBrazilianAirport?.iata)
+                .map((code) => {
+                  const hubObj = BRAZILIAN_INTERNATIONAL_AIRPORTS.find((h) => h.iata === code);
+                  if (!hubObj) return null;
+                  const active = connectionHubIata === code;
+                  return (
+                    <button
+                      key={code}
+                      type="button"
+                      onClick={() => {
+                        setConnectionHubIata(code);
+                        void runSearch({nextConnectionHub: code});
+                      }}
+                      className={`min-h-[30px] px-2.5 rounded-lg text-[11px] font-semibold border transition-colors ${
+                        active
+                          ? 'bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 border-transparent'
+                          : 'border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#13141A] text-zinc-600 dark:text-zinc-300 hover:border-zinc-400'
+                      }`}
+                    >
+                      Via {hubObj.iata} ({hubObj.city.split(' ')[0]})
+                    </button>
+                  );
+                })}
+            </div>
+          </div>
+        )}
 
         {/* Dates, Passengers, Cabin & Search Button */}
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-12 gap-3 items-end">
@@ -819,10 +982,19 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
             <div className="xl:col-span-8 rounded-2xl bg-white dark:bg-[#13141A] border border-zinc-200 dark:border-zinc-800 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                  {result.origin.city} ({result.origin.iata}) → {result.destination.city} (
-                  {result.destination.iata}) · {result.distanceKm.toLocaleString('pt-BR')} km ·{' '}
-                  {result.offers.length} voos reais em {uniqueAirlines.length}{' '}
-                  {uniqueAirlines.length === 1 ? 'companhia' : 'companhias'}
+                  {result.origin.city} ({result.origin.iata})
+                  {result.connectionHub ? (
+                    <>
+                      {' '}
+                      →{' '}
+                      <span className="font-semibold text-amber-700 dark:text-yellow-400">
+                        {result.connectionHub.city} ({result.connectionHub.iata})
+                      </span>
+                    </>
+                  ) : null}{' '}
+                  → {result.destination.city} ({result.destination.iata}) ·{' '}
+                  {result.distanceKm.toLocaleString('pt-BR')} km · {result.offers.length} voos reais em{' '}
+                  {uniqueAirlines.length} {uniqueAirlines.length === 1 ? 'opção' : 'opções'}
                 </p>
                 {result.lowestPrice > 0 ? (
                   <div className="mt-1.5 flex flex-wrap items-baseline gap-x-4 gap-y-1">
@@ -985,15 +1157,42 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
                 ))}
               </div>
 
-              <label className="min-h-[38px] px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-700 dark:text-zinc-300 inline-flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={directOnly}
-                  onChange={(e) => setDirectOnly(e.target.checked)}
-                  className="rounded border-zinc-300 text-red-600 focus:ring-red-600"
-                />
-                <span>Somente voos diretos</span>
-              </label>
+              {hasSplitOffers && hasSingleTicketOffers && (
+                <div className="inline-flex items-center p-1 rounded-xl bg-zinc-200/80 dark:bg-[#13141A] border border-transparent dark:border-zinc-800">
+                  {(
+                    [
+                      {id: 'all', label: 'Todos'},
+                      {id: 'single', label: 'Bilhete Único'},
+                      {id: 'split', label: '2 Trechos via Hub'},
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setTicketModeFilter(opt.id)}
+                      className={`min-h-[34px] px-3 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
+                        ticketModeFilter === opt.id
+                          ? 'bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 font-semibold'
+                          : 'text-zinc-600 dark:text-zinc-400'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {!isNonInternationalOrigin && (
+                <label className="min-h-[38px] px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] text-xs font-medium text-zinc-700 dark:text-zinc-300 inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={directOnly}
+                    onChange={(e) => setDirectOnly(e.target.checked)}
+                    className="rounded border-zinc-300 text-red-600 focus:ring-red-600"
+                  />
+                  <span>Somente voos diretos</span>
+                </label>
+              )}
 
               {uniqueAirlines.length > 1 && (
                 <select
@@ -1143,6 +1342,66 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
                       </div>
                     </div>
 
+                    {/* 2-Leg Breakdown (Non-international -> International Hub -> Final Destination) */}
+                    {offer.isSplitConnection && offer.legs && (
+                      <div className="mt-4 rounded-xl border border-amber-400/35 bg-amber-50/40 dark:bg-[#0B0C10] p-3.5 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                          <span className="font-semibold text-amber-800 dark:text-yellow-400">
+                            Rota combinada em 2 trechos via {offer.connectionHubCity || offer.connectionHubIata} ({offer.connectionHubIata})
+                          </span>
+                          <span className="text-zinc-500 dark:text-zinc-400">
+                            Recomenda-se folga mínima de 3h na conexão internacional
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                          {offer.legs.map((leg, legIdx) => {
+                            const legUrl = !avoidThirdParty && leg.affiliatePartnerUrl
+                              ? leg.affiliatePartnerUrl
+                              : leg.hasDirectAirlineDeepLink
+                                ? leg.officialUrl
+                                : leg.rawUrl;
+                            return (
+                              <div
+                                key={`${offer.id}-leg-${legIdx}`}
+                                className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#13141A] p-3 flex items-center justify-between gap-3"
+                              >
+                                <div className="min-w-0 space-y-0.5">
+                                  <p className="text-[11px] font-bold text-zinc-950 dark:text-white flex items-center gap-1.5">
+                                    <span className="px-1.5 py-0.5 rounded bg-zinc-900 dark:bg-zinc-800 text-white font-mono-num text-[10px]">
+                                      Trecho {legIdx + 1}
+                                    </span>
+                                    <span className="font-mono-num">
+                                      {leg.originIata} → {leg.destinationIata}
+                                    </span>
+                                  </p>
+                                  <p className="text-xs text-zinc-700 dark:text-zinc-300 truncate">
+                                    {leg.airlineName} · {leg.flightNumber}
+                                  </p>
+                                  <p className="text-[11px] font-mono-num text-zinc-500 dark:text-zinc-400">
+                                    {leg.departureTime} → {leg.arrivalTime} · {formatDuration(leg.durationMinutes)} · {leg.stopLabel}
+                                  </p>
+                                </div>
+                                <div className="text-right shrink-0 space-y-1">
+                                  <p className="text-sm font-bold font-mono-num text-amber-700 dark:text-yellow-400">
+                                    {formatBRL(leg.priceBrl)}
+                                  </p>
+                                  <a
+                                    href={legUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="min-h-[30px] px-2.5 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-[11px] font-semibold inline-flex items-center gap-1 hover:opacity-90 whitespace-nowrap"
+                                  >
+                                    <span>Trecho {legIdx + 1}</span>
+                                    <ExternalLink className="w-3 h-3" />
+                                  </a>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
                     {/* Bottom Bar: Baggage / Miles / Official Source + Action Buttons */}
                     <div className="mt-4 pt-3.5 border-t border-zinc-100 dark:border-zinc-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-zinc-500 dark:text-zinc-400">
@@ -1229,7 +1488,48 @@ export const TravelFlightsView: React.FC<TravelFlightsViewProps> = ({
                           </a>
                         )}
 
-                        {offer.hasDirectAirlineDeepLink ? (
+                        {offer.isSplitConnection && offer.legs ? (
+                          <>
+                            <a
+                              href={
+                                avoidThirdParty
+                                  ? offer.legs[0].hasDirectAirlineDeepLink
+                                    ? offer.legs[0].officialUrl
+                                    : offer.legs[0].rawUrl
+                                  : offer.legs[0].affiliatePartnerUrl || offer.legs[0].rawUrl
+                              }
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="min-h-[38px] px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700 text-xs font-semibold text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 inline-flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                            >
+                              <span>
+                                1º {offer.legs[0].originIata}→{offer.legs[0].destinationIata}
+                              </span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                            <a
+                              href={
+                                avoidThirdParty
+                                  ? offer.legs[1].hasDirectAirlineDeepLink
+                                    ? offer.legs[1].officialUrl
+                                    : offer.legs[1].rawUrl
+                                  : offer.legs[1].affiliatePartnerUrl || offer.legs[1].rawUrl
+                              }
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className={`min-h-[38px] px-4 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+                                isBest
+                                  ? 'bg-red-600 hover:bg-red-700 text-white'
+                                  : 'bg-zinc-950 dark:bg-zinc-800 hover:opacity-90 text-white'
+                              }`}
+                            >
+                              <span>
+                                2º {offer.legs[1].originIata}→{offer.legs[1].destinationIata}
+                              </span>
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          </>
+                        ) : offer.hasDirectAirlineDeepLink ? (
                           <>
                             <a
                               href={offer.rawUrl}
