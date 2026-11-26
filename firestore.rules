@@ -1,0 +1,354 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Global Hardened Primitives ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidE164Phone(phone) {
+      return phone is string
+        && phone.size() >= 11
+        && phone.size() <= 20
+        && phone.matches('^\\+[0-9]{10,15}$');
+    }
+
+    function isValidWhatsappInviteUrl(url) {
+      return url is string
+        && url.size() <= 300
+        && (url == '' || url.matches('^https://(chat\\.whatsapp\\.com|whatsapp\\.com)/[a-zA-Z0-9_\\-/?=&.%]+$'));
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerified()
+        && request.auth.token.email is string
+        && request.auth.token.email.lower() == 'heitormodder_yt@hotmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin()
+        || (isVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    // --- Validation Blueprints (Anti-Update-Gap) ---
+    function isValidAdmin(data, uid) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'createdAt'])
+        && data.uid == uid
+        && isValidId(data.uid)
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 160
+        && data.createdAt is timestamp;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'preferredCategories', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'role', 'preferredCategories', 'createdAt', 'updatedAt'])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && data.role in ['member', 'admin']
+        && data.preferredCategories is list
+        && data.preferredCategories.size() <= 8
+        && (data.preferredCategories.size() == 0
+          || (data.preferredCategories[0] is string && data.preferredCategories[0].size() <= 40))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'photoUrl', 'createdAt', 'updatedAt'])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 160
+        && (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSavedDeal(data, userId, dealId) {
+      return data.keys().hasAll(['id', 'userId', 'dealType', 'title', 'storeOrAirline', 'price', 'affiliateUrl', 'createdAt'])
+        && data.keys().hasOnly(['id', 'userId', 'dealType', 'title', 'storeOrAirline', 'price', 'affiliateUrl', 'createdAt'])
+        && data.id == dealId
+        && isValidId(data.id)
+        && data.userId == userId
+        && isValidId(data.userId)
+        && data.dealType in ['product', 'flight']
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 180
+        && data.storeOrAirline is string
+        && data.storeOrAirline.size() >= 1
+        && data.storeOrAirline.size() <= 80
+        && data.price is number
+        && data.price >= 0
+        && data.price <= 1000000
+        && data.affiliateUrl is string
+        && data.affiliateUrl.size() >= 8
+        && data.affiliateUrl.size() <= 1200
+        && data.createdAt is timestamp;
+    }
+
+    function isValidWhatsappSettings(data) {
+      return data.keys().hasAll(['senderPhone', 'senderDisplayName', 'enabled', 'welcomeMessage', 'updatedByUid', 'updatedAt'])
+        && data.keys().hasOnly([
+          'senderPhone',
+          'senderDisplayName',
+          'enabled',
+          'welcomeMessage',
+          'groupName',
+          'groupInviteUrl',
+          'autoForwardAllDealsToGroup',
+          'updatedByUid',
+          'updatedAt'
+        ])
+        && isValidE164Phone(data.senderPhone)
+        && data.senderDisplayName is string
+        && data.senderDisplayName.size() >= 1
+        && data.senderDisplayName.size() <= 80
+        && data.enabled is bool
+        && data.welcomeMessage is string
+        && data.welcomeMessage.size() <= 400
+        && (!('groupName' in data) || (data.groupName is string && data.groupName.size() <= 100))
+        && (!('groupInviteUrl' in data) || isValidWhatsappInviteUrl(data.groupInviteUrl))
+        && (!('autoForwardAllDealsToGroup' in data) || data.autoForwardAllDealsToGroup is bool)
+        && data.updatedByUid == request.auth.uid
+        && isValidId(data.updatedByUid)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWhatsappSubscriber(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'phoneNumber', 'optIn', 'receiveProducts', 'receiveFlights', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid',
+          'displayName',
+          'phoneNumber',
+          'optIn',
+          'receiveProducts',
+          'receiveFlights',
+          'selectedProducts',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && isValidE164Phone(data.phoneNumber)
+        && data.optIn is bool
+        && data.receiveProducts is bool
+        && data.receiveFlights is bool
+        && (!('selectedProducts' in data)
+          || (data.selectedProducts is list
+            && data.selectedProducts.size() <= 20
+            && (data.selectedProducts.size() == 0
+              || (data.selectedProducts[0] is string
+                && data.selectedProducts[0].size() >= 1
+                && data.selectedProducts[0].size() <= 80))))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // --- Collection: /admins/{uid} ---
+    match /admins/{uid} {
+      allow get: if isSignedIn() && isValidId(uid) && (isOwner(uid) || isAdmin());
+      allow list: if false;
+      allow create: if isVerified()
+        && isValidId(uid)
+        && isValidAdmin(incoming(), uid)
+        && incoming().createdAt == request.time
+        && ((isBootstrappedAdmin() && request.auth.uid == uid) || isAdmin());
+      allow update: if false;
+      allow delete: if isVerified()
+        && isValidId(uid)
+        && isAdmin()
+        && request.auth.uid != uid;
+    }
+
+    // --- Collection: /users/{userId} ---
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isOwner(userId)
+        && (incoming().role == 'member' || (incoming().role == 'admin' && isAdmin()));
+      allow update: if isVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isOwner(userId)
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'preferredCategories', 'updatedAt']))
+          || (isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'preferredCategories', 'role', 'updatedAt']))
+        );
+      allow delete: if isVerified() && isValidId(userId) && isAdmin();
+
+      // --- Isolated PII Subcollection: /users/{userId}/private/{docId} ---
+      match /private/{docId} {
+        allow get: if isSignedIn()
+          && isValidId(userId)
+          && docId == 'info'
+          && (isOwner(userId) || isAdmin())
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow list: if false;
+        allow create: if isVerified()
+          && isValidId(userId)
+          && docId == 'info'
+          && isValidUserPrivateInfo(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isVerified()
+          && isValidId(userId)
+          && docId == 'info'
+          && isValidUserPrivateInfo(incoming(), userId)
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (isOwner(userId) || isAdmin())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'photoUrl', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(userId) && docId == 'info' && isAdmin();
+      }
+
+      // --- Member Bookmarks Subcollection: /users/{userId}/savedDeals/{dealId} ---
+      match /savedDeals/{dealId} {
+        allow get: if isSignedIn()
+          && isValidId(userId)
+          && isValidId(dealId)
+          && (isOwner(userId) || isAdmin())
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+        allow create: if isVerified()
+          && isValidId(userId)
+          && isValidId(dealId)
+          && isValidSavedDeal(incoming(), userId, dealId)
+          && incoming().createdAt == request.time
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isVerified()
+          && isValidId(userId)
+          && isValidId(dealId)
+          && isValidSavedDeal(incoming(), userId, dealId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (isOwner(userId) || isAdmin())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'price', 'affiliateUrl', 'storeOrAirline']);
+        allow delete: if isVerified()
+          && isValidId(userId)
+          && isValidId(dealId)
+          && (isOwner(userId) || isAdmin())
+          && exists(/databases/$(database)/documents/users/$(userId));
+      }
+    }
+
+    // --- Collection: /whatsappSettings/{docId} (Admin-managed forwarder + official group config) ---
+    match /whatsappSettings/{docId} {
+      allow get: if isSignedIn() && docId == 'forwarder';
+      allow list: if false;
+      allow create: if isVerified()
+        && docId == 'forwarder'
+        && isValidWhatsappSettings(incoming())
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isVerified()
+        && docId == 'forwarder'
+        && isValidWhatsappSettings(incoming())
+        && incoming().updatedAt == request.time
+        && isAdmin()
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'senderPhone',
+          'senderDisplayName',
+          'enabled',
+          'welcomeMessage',
+          'groupName',
+          'groupInviteUrl',
+          'autoForwardAllDealsToGroup',
+          'updatedByUid',
+          'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // --- Collection: /whatsappSubscribers/{userId} (PII-isolated customer WhatsApp links + chosen private products) ---
+    match /whatsappSubscribers/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerified()
+        && isValidId(userId)
+        && isValidWhatsappSubscriber(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isOwner(userId)
+        && exists(/databases/$(database)/documents/users/$(userId));
+      allow update: if isVerified()
+        && isValidId(userId)
+        && isValidWhatsappSubscriber(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/users/$(userId))
+        && (
+          (isOwner(userId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName',
+              'phoneNumber',
+              'optIn',
+              'receiveProducts',
+              'receiveFlights',
+              'selectedProducts',
+              'updatedAt'
+            ]))
+          || (isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['optIn', 'receiveProducts', 'receiveFlights', 'updatedAt']))
+        );
+      allow delete: if isVerified()
+        && isValidId(userId)
+        && (isOwner(userId) || isAdmin());
+    }
+  }
+}

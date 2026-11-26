@@ -1,0 +1,310 @@
+{
+  "entities": {
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted registry document identifying an application administrator.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the administrator."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160,
+          "description": "Verified administrator email address."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when admin access was recorded."
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public-safe member profile for Mega Achados 027 (PII isolated in private subcollection).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID matching the document ID."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Member display name shown in the header."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["member", "admin"],
+          "description": "Account access role (members cannot self-assign admin)."
+        },
+        "preferredCategories": {
+          "type": "array",
+          "description": "Up to 8 preferred promotion categories chosen by the user."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable account creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last profile update server timestamp."
+        }
+      },
+      "required": ["uid", "displayName", "role", "preferredCategories", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII document storing user email and photo URL.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160,
+          "description": "User email address (PII)."
+        },
+        "photoUrl": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Optional profile avatar URL."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable creation server timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update server timestamp."
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "SavedDeal": {
+      "title": "SavedDeal",
+      "description": "A product or travel promotion bookmarked by a signed-in user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Deterministic deal identifier matching the document ID."
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "dealType": {
+          "type": "string",
+          "enum": ["product", "flight"],
+          "description": "Whether the saved offer is a product or a flight."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180,
+          "description": "Deal title or route label."
+        },
+        "storeOrAirline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Retailer or airline name."
+        },
+        "price": {
+          "type": "number",
+          "description": "Saved promotion price in BRL."
+        },
+        "affiliateUrl": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 1200,
+          "description": "Direct offer or affiliate link."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when saved."
+        }
+      },
+      "required": ["id", "userId", "dealType", "title", "storeOrAirline", "price", "affiliateUrl", "createdAt"]
+    },
+    "WhatsappForwarderSettings": {
+      "title": "WhatsappForwarderSettings",
+      "description": "Admin-managed WhatsApp sender number used as the official message forwarder for opted-in members.",
+      "type": "object",
+      "properties": {
+        "senderPhone": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 20,
+          "pattern": "^\\+[0-9]{10,15}$",
+          "description": "Admin WhatsApp forwarder phone number in E.164 format (e.g., +5527998427710)."
+        },
+        "senderDisplayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Display name shown to customers for the official WhatsApp sender."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the WhatsApp forwarder is active for customer opt-in."
+        },
+        "welcomeMessage": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Optional welcome message prefilled when customers confirm their opt-in."
+        },
+        "groupName": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Official WhatsApp group name where all site promotions are automatically forwarded."
+        },
+        "groupInviteUrl": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Official WhatsApp group invite link (https://chat.whatsapp.com/...) for members to receive all deals."
+        },
+        "autoForwardAllDealsToGroup": {
+          "type": "boolean",
+          "description": "Whether every promotion announced on the site is automatically forwarded to the WhatsApp group."
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Admin UID who last updated the forwarder settings."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last update."
+        }
+      },
+      "required": ["senderPhone", "senderDisplayName", "enabled", "welcomeMessage", "updatedByUid", "updatedAt"]
+    },
+    "WhatsappSubscriber": {
+      "title": "WhatsappSubscriber",
+      "description": "PII-isolated customer WhatsApp phone binding linked to their account to receive private alerts ONLY for chosen products.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID matching the document ID."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Customer display name for personalized forwarding."
+        },
+        "phoneNumber": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 20,
+          "pattern": "^\\+[0-9]{10,15}$",
+          "description": "Customer WhatsApp phone number in E.164 format (PII)."
+        },
+        "optIn": {
+          "type": "boolean",
+          "description": "Whether the customer has actively enabled receiving private WhatsApp messages."
+        },
+        "receiveProducts": {
+          "type": "boolean",
+          "description": "Whether the customer wants private product alerts for their chosen products."
+        },
+        "receiveFlights": {
+          "type": "boolean",
+          "description": "Whether the customer wants flight deals."
+        },
+        "selectedProducts": {
+          "type": "array",
+          "description": "Up to 20 specific product names or keywords chosen by the customer to receive privately on WhatsApp."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server timestamp when phone was first linked."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last subscription update."
+        }
+      },
+      "required": ["uid", "displayName", "phoneNumber", "optIn", "receiveProducts", "receiveFlights", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{uid}": {
+      "schema": {
+        "$ref": "#/entities/AdminRecord"
+      },
+      "description": "Trusted administrator UIDs."
+    },
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "Public-safe user profiles and promotion preferences."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": {
+        "$ref": "#/entities/UserPrivateInfo"
+      },
+      "description": "Isolated PII subcollection (document id 'info') restricted to owner or admin."
+    },
+    "/users/{userId}/savedDeals/{dealId}": {
+      "schema": {
+        "$ref": "#/entities/SavedDeal"
+      },
+      "description": "Saved favorite product and travel promotions per user."
+    },
+    "/whatsappSettings/{docId}": {
+      "schema": {
+        "$ref": "#/entities/WhatsappForwarderSettings"
+      },
+      "description": "Admin-managed WhatsApp forwarder sender configuration (document id 'forwarder')."
+    },
+    "/whatsappSubscribers/{userId}": {
+      "schema": {
+        "$ref": "#/entities/WhatsappSubscriber"
+      },
+      "description": "PII-isolated customer WhatsApp phone links (owner self-service + admin forwarding access)."
+    }
+  }
+}

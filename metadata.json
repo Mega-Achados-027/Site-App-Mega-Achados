@@ -1,0 +1,6 @@
+{
+  "name": "OfertaRadar",
+  "description": "Monitoramento de preços em tempo real multi-lojas com alertas no WhatsApp, notificações push, links de afiliados, histórico detalhado e migração de bots do Telegram.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
