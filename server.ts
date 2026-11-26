@@ -211,8 +211,82 @@ function isFakeProductUrl(url: string): boolean {
   if (!url) return true;
   // Real KaBuM! product URLs always have a numeric product ID: /produto/123456
   if (/kabum\.com\.br\/produto\/\d+/i.test(url)) return false;
+  // Real Magazine Luiza / Magazine Você product URLs always contain /p/<sku>
+  if (/(?:magazineluiza|magazinevoce)\.com\.br\/.+\/p\/[a-z0-9]{5,14}/i.test(url)) return false;
   // Legacy synthetic URLs used /produto/<text-slug> on Amazon, Magalu, ML, Shopee, etc.
   return /\/produto\/[^/]+/i.test(url);
+}
+
+function isStoreSearchUrl(rawUrl: string): boolean {
+  if (!rawUrl || typeof rawUrl !== 'string') return true;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+
+    if (host.includes('amazon.')) {
+      if (/\/(?:dp|gp\/product|gp\/aw\/d|product)\/[a-z0-9]{10}/i.test(parsed.pathname)) {
+        return false;
+      }
+      return true;
+    }
+
+    if (host.includes('mercadolivre.') || host.includes('mercadolibre.')) {
+      if (host.startsWith('lista.') || path.startsWith('/jm/search') || path.startsWith('/social/')) {
+        return true;
+      }
+      if (/\/p\/mlb\d+/i.test(parsed.pathname) || /\/mlb-?\d{6,}/i.test(parsed.pathname)) {
+        return false;
+      }
+      return true;
+    }
+
+    if (host.includes('kabum.')) {
+      if (/\/produto\/\d+/i.test(parsed.pathname)) return false;
+      return true;
+    }
+
+    if (host.includes('magazineluiza.') || host.includes('magazinevoce.') || host.includes('magalu.')) {
+      if (path.includes('/busca/') || path.includes('/lapromotion/')) return true;
+      if (/\/p\/[a-z0-9]{5,14}(?:\/|$)/i.test(parsed.pathname)) return false;
+      return true;
+    }
+
+    if (host.includes('shopee.')) {
+      if (path.startsWith('/search') || parsed.searchParams.has('keyword')) return true;
+      if (/-i\.\d+\.\d+/i.test(parsed.pathname) || /\/product\/\d+\/\d+/i.test(parsed.pathname)) {
+        return false;
+      }
+      return true;
+    }
+
+    if (host.includes('casasbahia.')) {
+      if (/\/b\/?$/i.test(path) || path.startsWith('/busca/')) return true;
+      if (/\/p(?:\/|$)/i.test(path)) return false;
+      return true;
+    }
+
+    if (host.includes('aliexpress.')) {
+      if (path.startsWith('/w/wholesale-')) return true;
+      if (/\/item\/\d+\.html/i.test(path)) return false;
+      return true;
+    }
+
+    if (
+      path === '/' ||
+      path === '' ||
+      path.includes('/busca') ||
+      path.includes('/search') ||
+      parsed.searchParams.has('q') ||
+      parsed.searchParams.has('k') ||
+      parsed.searchParams.has('keyword')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function decodeHtmlEntities(input: string): string {
@@ -1223,6 +1297,9 @@ function evaluateProductForAnnouncement(
   return {offer: bestOffer, store, referencePrice, discountPercent};
 }
 
+let isRepairingSearchUrlDeals = false;
+let hasCompletedInitialDealUrlRepair = false;
+
 function pruneExpiredAndInvalidDeals(shouldBroadcast = false): boolean {
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
@@ -1260,9 +1337,14 @@ function pruneExpiredAndInvalidDeals(shouldBroadcast = false): boolean {
       continue;
     }
 
-    // 5a. Live-discovered real store deals (KaBuM! / Amazon BR) stay valid for up to 3 hours while store is active
+    // 5a. Live-discovered real store deals stay valid for up to 3 hours while store is active
     if (deal.isLiveDiscovered) {
       if (deal.announcedDiscountPercent < 3 || deal.announcedPrice <= 0) {
+        changed = true;
+        continue;
+      }
+      // Reject any deal that still points to a store search page once startup repair is complete
+      if (hasCompletedInitialDealUrlRepair && !isRepairingSearchUrlDeals && isStoreSearchUrl(deal.rawUrl)) {
         changed = true;
         continue;
       }
@@ -2413,7 +2495,15 @@ async function manualSearchAndAnnounceDeals(opts?: {
       }
     }
 
-    pushUnique(promobitDeals, 10);
+    // Resolve Promobit candidates to REAL direct store product URLs before accepting them
+    const promobitCandidates = promobitDeals.filter((item) => !isDuplicateForCycle(item));
+    const resolvedPromobit = await ensureDirectProductUrlsForDeals(
+      promobitCandidates,
+      activeStores,
+      Math.max(1, 10 - combinedFresh.length),
+    );
+
+    pushUnique(resolvedPromobit, 10);
     pushUnique(retailWithCoupon, 12);
     if (combinedFresh.length < 6) {
       pushUnique(retailWithoutCoupon, 12);
@@ -2501,8 +2591,10 @@ async function publishScheduledDealBatch(): Promise<void> {
       }
     };
 
+    const directOnlyFallback: AnnouncedDeal[] = [];
+
     // Run up to 3 rotating passes if earlier routes only had already-published products
-    for (let pass = 0; pass < 3 && freshCandidates.length < dropSize; pass++) {
+    for (let pass = 0; pass < 3 && freshCandidates.length < dropSize * 2; pass++) {
       manualSearchCursor = (manualSearchCursor + 1) % LIVE_DEAL_TOPICS.length;
       const rotatingTopic = LIVE_DEAL_TOPICS[manualSearchCursor];
       const rotatingKabumPage = ((manualSearchCursor + pass * 9) % 36) + 1;
@@ -2552,11 +2644,40 @@ async function publishScheduledDealBatch(): Promise<void> {
         return b.announcedDiscountPercent - a.announcedDiscountPercent;
       });
       collectNeverRepeated(promoFlat);
-      collectNeverRepeated(liveAmazonRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons)));
-      collectNeverRepeated(liveKabumRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons)));
+      const amazonWithCoupons = liveAmazonRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
+      const kabumWithCoupons = liveKabumRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
+      collectNeverRepeated(amazonWithCoupons);
+      collectNeverRepeated(kabumWithCoupons);
+
+      // Keep direct-URL Amazon/KaBuM deals as backup in case Promobit candidates cannot resolve
+      for (const d of [...amazonWithCoupons, ...kabumWithCoupons]) {
+        if (!isStoreSearchUrl(d.rawUrl) && !isProductAlreadyPublished(d, historySet)) {
+          directOnlyFallback.push(d);
+        }
+      }
     }
 
-    const newlyPublished = freshCandidates.slice(0, dropSize);
+    // Resolve direct store product URLs for selected candidates (NEVER publish search-page links!)
+    const resolvedBatch = await ensureDirectProductUrlsForDeals(
+      freshCandidates,
+      activeStores,
+      dropSize,
+    );
+
+    const newlyPublished: AnnouncedDeal[] = [...resolvedBatch];
+    if (newlyPublished.length < dropSize && directOnlyFallback.length > 0) {
+      const takenIds = new Set(newlyPublished.map((d) => d.productId));
+      const takenFp = new Set(newlyPublished.map((d) => normalizeProductFingerprint(d.productName)));
+      for (const d of directOnlyFallback) {
+        if (newlyPublished.length >= dropSize) break;
+        if (takenIds.has(d.productId)) continue;
+        const fp = normalizeProductFingerprint(d.productName);
+        if (fp && takenFp.has(fp)) continue;
+        takenIds.add(d.productId);
+        if (fp) takenFp.add(fp);
+        newlyPublished.push(d);
+      }
+    }
 
     if (newlyPublished.length > 0) {
       recordPublishedProducts(newlyPublished);
@@ -2636,17 +2757,32 @@ function isSafePublicRetailHost(hostname: string): boolean {
   return true;
 }
 
-function canonicalizeDirectStoreProductUrl(rawTargetUrl: string, store: StoreConfig): string | null {
+function buildCleanUrlSlug(input?: string): string {
+  const cleaned = String(input || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64);
+  return cleaned && cleaned !== 'produto' ? cleaned : 'oferta';
+}
+
+function canonicalizeDirectStoreProductUrl(
+  rawTargetUrl: string,
+  store: StoreConfig,
+  fallbackTitle?: string,
+): string | null {
   try {
     const parsed = new URL(rawTargetUrl);
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
     if (!isSafePublicRetailHost(parsed.hostname)) return null;
 
-    // Unwrap affiliate/tracking redirect wrappers (Awin, Lomadee, Rakuten, etc.) if present
-    for (const key of ['ued', 'murl', 'url', 'redirect', 'u']) {
+    // Unwrap affiliate/tracking redirect wrappers (Awin, Lomadee, Rakuten, Admitad, etc.) if present
+    for (const key of ['ued', 'murl', 'url', 'redirect', 'u', 'ulp', 'target', 'dest', 'redir']) {
       const embedded = parsed.searchParams.get(key);
       if (embedded && /^https?:\/\//i.test(embedded)) {
-        const unwrapped = canonicalizeDirectStoreProductUrl(embedded, store);
+        const unwrapped = canonicalizeDirectStoreProductUrl(embedded, store, fallbackTitle);
         if (unwrapped) return unwrapped;
       }
     }
@@ -2655,21 +2791,95 @@ function canonicalizeDirectStoreProductUrl(rawTargetUrl: string, store: StoreCon
     const storeDom = store.domain.toLowerCase().replace(/^www\./, '');
     const storeMatches =
       host.includes(storeDom) ||
-      (storeDom.includes('magazineluiza') && host.includes('magalu')) ||
+      (storeDom.includes('magazineluiza') &&
+        (host.includes('magalu') || host.includes('magazinevoce'))) ||
       (storeDom.includes('mercadolivre') && host.includes('mercadolibre'));
     if (!storeMatches) return null;
 
-    // Canonicalize Amazon product URLs straight to /dp/{ASIN} so it NEVER opens a search field
+    // 1. Amazon BR: strictly require ASIN and canonicalize to /dp/{ASIN} (never /s?k= search)
     if (host.includes('amazon.')) {
-      const asinMatch = parsed.pathname.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i);
+      const asinMatch = parsed.pathname.match(
+        /\/(?:dp|gp\/product|gp\/aw\/d|product)\/([A-Z0-9]{10})/i,
+      );
       if (asinMatch) {
         return `https://www.amazon.com.br/dp/${asinMatch[1].toUpperCase()}`;
       }
-      // Reject Amazon search URLs from redirect resolution
-      if (parsed.pathname === '/s' || parsed.pathname.startsWith('/s/')) return null;
+      return null;
     }
 
-    // Strip third-party aggregator / Zoom / Buscapé tracking parameters so our own affiliate tag applies cleanly
+    // 2. KaBuM!: strictly require numeric /produto/{id}
+    if (host.includes('kabum.')) {
+      const kabumMatch = parsed.pathname.match(/\/produto\/(\d+)(\/[^/?#]*)?/i);
+      if (kabumMatch) {
+        return `https://www.kabum.com.br/produto/${kabumMatch[1]}${kabumMatch[2] || ''}`;
+      }
+      return null;
+    }
+
+    // 3. Magazine Luiza / Magazine Você: canonicalize to magazineluiza.com.br/{slug}/p/{sku}/ so our own magazinevoce tag applies cleanly
+    if (host.includes('magazineluiza.') || host.includes('magazinevoce.') || host.includes('magalu.')) {
+      // Handle Promobit / Magalu divulgador links: /lapromotion/divulgador/oferta/{sku}/{cat}/{subcat}/
+      const lapromoMatch = parsed.pathname.match(
+        /\/lapromotion\/divulgador\/oferta\/([a-z0-9]{5,14})(\/[^?#]*)?/i,
+      );
+      if (lapromoMatch) {
+        const sku = lapromoMatch[1];
+        const trailing = (lapromoMatch[2] || '/').replace(/\/?$/, '/');
+        const slug = buildCleanUrlSlug(fallbackTitle);
+        return `https://www.magazineluiza.com.br/${slug}/p/${sku}${trailing}`;
+      }
+
+      // Standard Magalu or MagazineVocê product path: /[optional-partner/]slug/p/{sku}[/cat/subcat/]
+      const magaluProdMatch = parsed.pathname.match(
+        /\/([^/]+)\/p\/([a-z0-9]{5,14})(\/[^?#]*)?/i,
+      );
+      if (magaluProdMatch) {
+        const segSlug =
+          magaluProdMatch[1].toLowerCase() === 'produto'
+            ? buildCleanUrlSlug(fallbackTitle)
+            : magaluProdMatch[1];
+        const sku = magaluProdMatch[2];
+        const trailing = (magaluProdMatch[3] || '/').replace(/\/?$/, '/');
+        return `https://www.magazineluiza.com.br/${segSlug}/p/${sku}${trailing}`;
+      }
+      return null;
+    }
+
+    // 4. Mercado Livre: strictly require direct product page (/p/MLB... or /MLB-...) — reject lista.* and /social/*
+    if (host.includes('mercadolivre.') || host.includes('mercadolibre.')) {
+      if (
+        host.startsWith('lista.') ||
+        parsed.pathname.toLowerCase().startsWith('/social/') ||
+        parsed.pathname.toLowerCase().startsWith('/jm/search')
+      ) {
+        return null;
+      }
+      if (/\/p\/MLB\d+/i.test(parsed.pathname) || /\/MLB-?\d{6,}/i.test(parsed.pathname)) {
+        return `https://${parsed.hostname}${parsed.pathname}`;
+      }
+      return null;
+    }
+
+    // 5. Shopee: strictly require direct product page (-i.{shopId}.{itemId} or /product/{shopId}/{itemId})
+    if (host.includes('shopee.')) {
+      if (
+        /-i\.\d+\.\d+/i.test(parsed.pathname) ||
+        /\/product\/\d+\/\d+/i.test(parsed.pathname)
+      ) {
+        return `https://${parsed.hostname}${parsed.pathname}`;
+      }
+      return null;
+    }
+
+    // 6. Casas Bahia: strictly require /p product path
+    if (host.includes('casasbahia.')) {
+      if (/\/p(?:\/|$)/i.test(parsed.pathname) && !/\/b\/?$/i.test(parsed.pathname)) {
+        return `https://${parsed.hostname}${parsed.pathname}`;
+      }
+      return null;
+    }
+
+    // Strip third-party aggregator / tracking parameters so our own affiliate tag applies cleanly
     const cleanUrl = new URL(`https://${parsed.hostname}${parsed.pathname}`);
     const keepParams = new Set(['sku', 'skuId', 'item_id', 'variation', 'model']);
     parsed.searchParams.forEach((val, key) => {
@@ -2678,10 +2888,382 @@ function canonicalizeDirectStoreProductUrl(rawTargetUrl: string, store: StoreCon
       }
     });
     const finalStr = cleanUrl.toString();
-    if (isFakeProductUrl(finalStr)) return null;
+    if (isFakeProductUrl(finalStr) || isStoreSearchUrl(finalStr)) return null;
     return finalStr;
   } catch {
     return null;
+  }
+}
+
+const directProductUrlCache = new Map<string, {url: string | null; cachedAt: number}>();
+let promobitRedirectCooldownUntilMs = 0;
+let lastPromobitRedirectFetchMs = 0;
+
+function extractDirectMlProductUrlFromSocialHtml(
+  html: string,
+  productTitle: string,
+  store: StoreConfig,
+): string | null {
+  const matches = [
+    ...html.matchAll(
+      /https?:\/\/(?:www\.|produto\.)?mercadolivre\.com\.br\/[^"'\s<>\\]+(?:\/p\/MLB\d+|\/MLB-?\d{6,})[^"'\s<>\\]*/gi,
+    ),
+  ];
+  if (matches.length === 0) return null;
+
+  const titleTokens = normalizeSearchTokens(productTitle);
+  let bestUrl: string | null = null;
+  let bestScore = -1;
+
+  const seen = new Set<string>();
+  for (const m of matches) {
+    const rawCandidate = decodeHtmlEntities(m[0]);
+    const isFeaturedCard = /card-featured|reco_item_pos=0/i.test(rawCandidate);
+    const canonical = canonicalizeDirectStoreProductUrl(rawCandidate, store, productTitle);
+    if (!canonical || seen.has(canonical)) continue;
+    seen.add(canonical);
+
+    const pathScore = scoreTitleMatch(titleTokens, canonical.replace(/[-/]+/g, ' '));
+    const totalScore = pathScore + (isFeaturedCard ? 0.65 : 0);
+    if (totalScore > bestScore) {
+      bestScore = totalScore;
+      bestUrl = canonical;
+    }
+  }
+
+  return bestUrl;
+}
+
+async function unwrapShortlinkToDirectStoreUrl(
+  startUrl: string,
+  store: StoreConfig,
+  productTitle: string,
+): Promise<string | null> {
+  const immediate = canonicalizeDirectStoreProductUrl(startUrl, store, productTitle);
+  if (immediate) return immediate;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    let currentUrl = startUrl;
+    for (let hop = 0; hop < 5; hop++) {
+      const parsedCur = new URL(currentUrl);
+      if (
+        !['https:', 'http:'].includes(parsedCur.protocol) ||
+        !isSafePublicRetailHost(parsedCur.hostname)
+      ) {
+        return null;
+      }
+
+      const resp = await fetch(currentUrl, {
+        redirect: 'manual',
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Accept-Language': 'pt-BR,pt;q=0.9',
+        },
+        signal: controller.signal,
+      });
+
+      const loc = resp.headers.get('location');
+      if (loc) {
+        const nextUrl = loc.startsWith('http') ? loc : new URL(loc, currentUrl).toString();
+        const canonical = canonicalizeDirectStoreProductUrl(nextUrl, store, productTitle);
+        if (canonical) return canonical;
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      // If we landed on a 200 HTML page (e.g., mercadolivre.com.br/social/... or meta refresh), extract direct product link
+      if (resp.ok) {
+        const html = await resp.text();
+        if (
+          parsedCur.hostname.toLowerCase().includes('mercadolivre.') &&
+          parsedCur.pathname.toLowerCase().includes('/social/')
+        ) {
+          return extractDirectMlProductUrlFromSocialHtml(html, productTitle, store);
+        }
+
+        const metaRefresh = html.match(
+          /<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=([^"'\s>]+)/i,
+        );
+        if (metaRefresh?.[1]) {
+          const nextUrl = decodeHtmlEntities(metaRefresh[1]);
+          const canonical = canonicalizeDirectStoreProductUrl(nextUrl, store, productTitle);
+          if (canonical) return canonical;
+          currentUrl = nextUrl.startsWith('http') ? nextUrl : new URL(nextUrl, currentUrl).toString();
+          continue;
+        }
+
+        const canonicalTag =
+          html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["'](https?:\/\/[^"']+)["']/i) ||
+          html.match(/<link[^>]+href=["'](https?:\/\/[^"']+)["'][^>]+rel=["']canonical["']/i);
+        if (canonicalTag?.[1]) {
+          const canonical = canonicalizeDirectStoreProductUrl(
+            decodeHtmlEntities(canonicalTag[1]),
+            store,
+            productTitle,
+          );
+          if (canonical) return canonical;
+        }
+      }
+      break;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveDirectProductUrlFromPromobit(
+  offerId: string,
+  store: StoreConfig,
+  productTitle: string,
+): Promise<string | null> {
+  const cleanId = String(offerId || '').replace(/\D/g, '');
+  if (!cleanId) return null;
+
+  const now = Date.now();
+  if (now < promobitRedirectCooldownUntilMs) {
+    return null;
+  }
+
+  // Gentle pacing (~320ms between requests) to avoid Promobit 429 throttling
+  const elapsed = now - lastPromobitRedirectFetchMs;
+  if (elapsed < 320) {
+    await new Promise((resolve) => setTimeout(resolve, 320 - elapsed));
+  }
+  lastPromobitRedirectFetchMs = Date.now();
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const redirectUrl = `https://www.promobit.com.br/Redirect/to/${cleanId}/`;
+    const resp = await fetch(redirectUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Referer: 'https://www.promobit.com.br/',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      signal: controller.signal,
+    });
+
+    if (resp.status === 429) {
+      promobitRedirectCooldownUntilMs = Date.now() + 90_000;
+      return null;
+    }
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const targetMatch =
+      html.match(/,\s*l\s*=\s*['"](https?:\/\/[^'"]+)['"]/) ||
+      html.match(/location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/) ||
+      html.match(/url=(https?:\/\/[^"'\s>]+)/i);
+
+    if (!targetMatch?.[1]) return null;
+    const rawTarget = decodeHtmlEntities(targetMatch[1]).replace(/\\\//g, '/');
+
+    return await unwrapShortlinkToDirectStoreUrl(rawTarget, store, productTitle);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveDirectProductUrlForDeal(opts: {
+  store: StoreConfig;
+  productTitle: string;
+  productId?: string;
+  candidateUrl?: string;
+}): Promise<string | null> {
+  const {store, productTitle, productId, candidateUrl} = opts;
+
+  // 1. Already a valid direct product URL? Return clean canonical version immediately.
+  if (candidateUrl) {
+    const existingCanonical = canonicalizeDirectStoreProductUrl(candidateUrl, store, productTitle);
+    if (existingCanonical) return existingCanonical;
+  }
+
+  const cacheKey = `${store.id}::${productId || ''}::${normalizeProductFingerprint(productTitle)}`;
+  const cached = directProductUrlCache.get(cacheKey);
+  if (cached) {
+    const ttl = cached.url ? 2 * 60 * 60 * 1000 : 5 * 60 * 1000;
+    if (Date.now() - cached.cachedAt < ttl) {
+      return cached.url;
+    }
+  }
+
+  let resolved: string | null = null;
+
+  // 2. If this offer originated from Promobit (productId = "promo-{offerId}"), extract its exact store destination!
+  const promoMatch = String(productId || '').match(/^promo-(\d+)$/);
+  if (promoMatch?.[1]) {
+    resolved = await resolveDirectProductUrlFromPromobit(promoMatch[1], store, productTitle);
+  }
+
+  // 3. Store-direct fallbacks (work seamlessly even if Promobit throttles 429 or returns a generic page)
+  if (!resolved) {
+    const cleanQuery = cleanProductTitleForStoreSearch(productTitle)
+      .split(' ')
+      .slice(0, 7)
+      .join(' ');
+    const storeDom = store.domain.toLowerCase();
+
+    if (storeDom.includes('amazon.')) {
+      const amz = await fetchLiveAmazonSearchOffer(cleanQuery, store);
+      if (amz?.rawUrl) {
+        resolved = canonicalizeDirectStoreProductUrl(amz.rawUrl, store, productTitle);
+      }
+    } else if (storeDom.includes('kabum.')) {
+      const kb = await fetchLiveKabumSearchOffer(cleanQuery, store);
+      if (kb?.rawUrl) {
+        resolved = canonicalizeDirectStoreProductUrl(kb.rawUrl, store, productTitle);
+      }
+    }
+
+    // Cross-store comparator lead unwrap (great for Magazine Luiza, Mercado Livre, Casas Bahia, and backup for Amazon/KaBuM)
+    if (!resolved && cleanQuery.length >= 4) {
+      try {
+        const comp = await fetchBuscapeCrossStoreOffers(cleanQuery, [store]);
+        const match = comp.byStoreId.get(store.id);
+        if (match?.rawUrl) {
+          resolved = canonicalizeDirectStoreProductUrl(match.rawUrl, store, productTitle);
+        }
+      } catch {
+        // Fallback silently
+      }
+    }
+  }
+
+  directProductUrlCache.set(cacheKey, {url: resolved, cachedAt: Date.now()});
+  if (directProductUrlCache.size > 600) {
+    const oldestKey = directProductUrlCache.keys().next().value;
+    if (oldestKey) directProductUrlCache.delete(oldestKey);
+  }
+
+  return resolved;
+}
+
+async function ensureDirectProductUrlsForDeals(
+  candidates: AnnouncedDeal[],
+  activeStores: StoreConfig[],
+  maxWanted: number,
+): Promise<AnnouncedDeal[]> {
+  const storeMap = new Map(activeStores.map((s) => [s.id, s]));
+  const verified: AnnouncedDeal[] = [];
+  let resolveAttempts = 0;
+  const maxAttempts = Math.max(maxWanted * 2 + 4, 12);
+
+  for (const deal of candidates) {
+    if (verified.length >= maxWanted) break;
+    const store = storeMap.get(deal.storeId);
+    if (!store) continue;
+
+    // Fast path: already a direct product URL (e.g. fetchLiveAmazonDeals / fetchLiveKabumDeals)
+    const immediate = canonicalizeDirectStoreProductUrl(deal.rawUrl, store, deal.productName);
+    if (immediate) {
+      verified.push({
+        ...deal,
+        rawUrl: immediate,
+        affiliateUrl: buildAffiliateUrl(immediate, store),
+      });
+      continue;
+    }
+
+    if (resolveAttempts >= maxAttempts) continue;
+    resolveAttempts++;
+
+    const directUrl = await resolveDirectProductUrlForDeal({
+      store,
+      productTitle: deal.productName,
+      productId: deal.productId,
+      candidateUrl: deal.rawUrl,
+    });
+
+    if (directUrl && !isStoreSearchUrl(directUrl)) {
+      verified.push({
+        ...deal,
+        rawUrl: directUrl,
+        affiliateUrl: buildAffiliateUrl(directUrl, store),
+      });
+    }
+  }
+
+  return verified;
+}
+
+async function repairSearchUrlAnnouncedDeals(): Promise<void> {
+  if (isRepairingSearchUrlDeals) return;
+  const needsRepair = state.announcedDeals.some((d) => isStoreSearchUrl(d.rawUrl));
+  if (!needsRepair) return;
+
+  isRepairingSearchUrlDeals = true;
+  try {
+    const storeMap = new Map(state.stores.filter((s) => s.active).map((s) => [s.id, s]));
+    const upgraded: AnnouncedDeal[] = [];
+    let repairedCount = 0;
+    let droppedCount = 0;
+
+    for (const deal of state.announcedDeals) {
+      const store = storeMap.get(deal.storeId);
+      if (!store) {
+        droppedCount++;
+        continue;
+      }
+
+      const existingDirect = canonicalizeDirectStoreProductUrl(
+        deal.rawUrl,
+        store,
+        deal.productName,
+      );
+      if (existingDirect) {
+        upgraded.push({
+          ...deal,
+          rawUrl: existingDirect,
+          affiliateUrl: buildAffiliateUrl(existingDirect, store),
+        });
+        continue;
+      }
+
+      const resolvedDirect = await resolveDirectProductUrlForDeal({
+        store,
+        productTitle: deal.productName,
+        productId: deal.productId,
+        candidateUrl: deal.rawUrl,
+      });
+
+      if (resolvedDirect && !isStoreSearchUrl(resolvedDirect)) {
+        repairedCount++;
+        upgraded.push({
+          ...deal,
+          rawUrl: resolvedDirect,
+          affiliateUrl: buildAffiliateUrl(resolvedDirect, store),
+          lastVerifiedAt: new Date().toISOString(),
+        });
+      } else {
+        droppedCount++;
+      }
+    }
+
+    state.announcedDeals = upgraded;
+    saveState(state);
+    broadcast('announcedDeals:synced', state.announcedDeals);
+    console.log(
+      `Direct product URL repair finished: ${repairedCount} upgraded, ${droppedCount} unresolved search-URL deals removed (${upgraded.length} active).`,
+    );
+
+    if (state.announcedDeals.length < 6) {
+      void publishScheduledDealBatch();
+    }
+  } catch (err) {
+    console.warn('Error repairing search-URL announced deals:', err);
+  } finally {
+    isRepairingSearchUrlDeals = false;
+    hasCompletedInitialDealUrlRepair = true;
   }
 }
 
@@ -3396,6 +3978,7 @@ async function searchProductAcrossConfiguredStores(
   }
 
   // Merge Promobit live product+coupon matches (great for Mercado Livre, Shopee, Magalu, Casas Bahia!)
+  const promobitToResolve: Array<{deal: AnnouncedDeal; store: StoreConfig}> = [];
   for (const deal of promobitBatches.flat()) {
     const matchScore = scoreTitleMatch(qTokens, deal.productName);
     if (matchScore < (qTokens.length >= 2 ? 0.6 : 1)) continue;
@@ -3414,6 +3997,8 @@ async function searchProductAcrossConfiguredStores(
       : undefined;
 
     if (!existing || deal.announcedPrice < existing.price) {
+      const existingDirect =
+        existing?.rawUrl && !isStoreSearchUrl(existing.rawUrl) ? existing.rawUrl : '';
       candidatesByStore.set(deal.storeId, {
         storeId: deal.storeId,
         productTitle: deal.productName,
@@ -3423,13 +4008,33 @@ async function searchProductAcrossConfiguredStores(
         discountPercent: deal.announcedDiscountPercent,
         installments: deal.installments,
         shipping: deal.shipping,
-        rawUrl: existing?.rawUrl || deal.rawUrl,
+        rawUrl: existingDirect || deal.rawUrl,
         sourceLabel: 'Oferta + cupom ao vivo',
         specificCoupon,
       });
+      if (!existingDirect) {
+        const matchedStore = activeStores.find((s) => s.id === deal.storeId);
+        if (matchedStore) promobitToResolve.push({deal, store: matchedStore});
+      }
       if (!sharedImageUrl && deal.imageUrl) sharedImageUrl = deal.imageUrl;
     } else if (specificCoupon && !existing.specificCoupon) {
       existing.specificCoupon = specificCoupon;
+    }
+  }
+
+  // Upgrade any Promobit live-search matches from search URLs to their exact direct product page
+  for (const {deal, store} of promobitToResolve.slice(0, 4)) {
+    const current = candidatesByStore.get(store.id);
+    if (!current || !isStoreSearchUrl(current.rawUrl)) continue;
+    const directUrl = await resolveDirectProductUrlForDeal({
+      store,
+      productTitle: deal.productName,
+      productId: deal.productId,
+      candidateUrl: deal.rawUrl,
+    });
+    if (directUrl && !isStoreSearchUrl(directUrl)) {
+      current.rawUrl = directUrl;
+      current.sourceLabel = `Direto ${store.name}`;
     }
   }
 
@@ -3479,13 +4084,13 @@ async function searchProductAcrossConfiguredStores(
             .trim()
             .toUpperCase()
             .replace(/[^A-Z0-9_-]/g, '');
+          const canonicalGeminiUrl =
+            typeof item.productUrl === 'string'
+              ? canonicalizeDirectStoreProductUrl(item.productUrl, store, cleanTitle || query)
+              : null;
           const cleanUrl =
-            typeof item.productUrl === 'string' &&
-            item.productUrl.startsWith('https://') &&
-            !isFakeProductUrl(item.productUrl) &&
-            item.productUrl.toLowerCase().includes(store.domain.toLowerCase().replace(/^www\./, ''))
-              ? item.productUrl
-              : buildValidStoreSearchUrl(store, cleanProductTitleForStoreSearch(cleanTitle || query));
+            canonicalGeminiUrl ||
+            buildValidStoreSearchUrl(store, cleanProductTitleForStoreSearch(cleanTitle || query));
 
           candidatesByStore.set(store.id, {
             storeId: store.id,
@@ -7346,8 +7951,14 @@ async function startServer() {
   const initialNextDealPublishMs = state.dealFeedMeta?.nextPublishAt
     ? new Date(state.dealFeedMeta.nextPublishAt).getTime()
     : 0;
-  if (state.announcedDeals.length === 0 || Date.now() >= initialNextDealPublishMs) {
-    void publishScheduledDealBatch();
+  // Immediately upgrade any legacy search-page promotion URLs in the saved DB to real direct product links
+  if (state.announcedDeals.some((d) => isStoreSearchUrl(d.rawUrl))) {
+    void repairSearchUrlAnnouncedDeals();
+  } else {
+    hasCompletedInitialDealUrlRepair = true;
+    if (state.announcedDeals.length === 0 || Date.now() >= initialNextDealPublishMs) {
+      void publishScheduledDealBatch();
+    }
   }
 
   setInterval(() => {
