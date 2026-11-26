@@ -1,10 +1,12 @@
 import React, {createContext, useCallback, useContext, useEffect, useRef, useState} from 'react';
 import {
-  browserPopupRedirectResolver,
+  browserSessionPersistence,
+  getRedirectResult,
   inMemoryPersistence,
   onAuthStateChanged,
   setPersistence,
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   type User,
 } from 'firebase/auth';
@@ -95,6 +97,7 @@ interface AuthContextValue {
   adminSubscribers: WhatsappSubscriber[];
   clearAuthError: () => void;
   signInWithGoogle: (draft?: PendingSignupDraft) => Promise<boolean>;
+  signInWithGoogleRedirect: (draft?: PendingSignupDraft) => Promise<void>;
   updateUserProfile: (displayName: string, preferredCategories: string[]) => Promise<void>;
   toggleSaveDeal: (input: SaveDealInput) => Promise<boolean>;
   isDealSaved: (rawId: string) => boolean;
@@ -311,6 +314,25 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
   }, []);
 
   useEffect(() => {
+    // Restore any pending signup draft saved prior to redirect login
+    try {
+      const savedDraftRaw = sessionStorage.getItem('megaachados_pending_signup_draft');
+      if (savedDraftRaw) {
+        sessionStorage.removeItem('megaachados_pending_signup_draft');
+        pendingDraftRef.current = JSON.parse(savedDraftRaw) as PendingSignupDraft;
+      }
+    } catch {
+      // Ignore storage access errors in restricted contexts
+    }
+
+    // Complete redirect sign-in if the user used the non-popup redirect fallback
+    void getRedirectResult(auth).catch((err: unknown) => {
+      const code = typeof (err as {code?: unknown})?.code === 'string' ? (err as {code: string}).code : '';
+      if (code && code !== 'auth/no-auth-event') {
+        console.error('Google Redirect Sign-In error:', code, err);
+      }
+    });
+
     const unsub = onAuthStateChanged(auth, async (nextUser) => {
       setUser(nextUser);
       if (!nextUser) {
@@ -496,41 +518,55 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
     setAuthError(null);
     pendingDraftRef.current = draft || null;
     try {
-      await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
+      await signInWithPopup(auth, googleProvider);
       return true;
     } catch (err: unknown) {
       let finalErr = err;
-      const initialCode = (err as {code?: string})?.code || '';
+      const initialCode =
+        typeof (err as {code?: unknown})?.code === 'string' ? (err as {code: string}).code : '';
 
-      // If browser storage partitioning or iframe restrictions caused an internal/storage error, retry with in-memory persistence
+      // Retry with session / in-memory persistence if browser storage partitioning or iframe restrictions interfered
       if (
         initialCode === 'auth/internal-error' ||
         initialCode === 'auth/web-storage-unsupported' ||
-        initialCode === 'auth/operation-not-supported-in-this-environment'
+        initialCode === 'auth/operation-not-supported-in-this-environment' ||
+        initialCode === 'auth/missing-initial-state'
       ) {
-        try {
-          await setPersistence(auth, inMemoryPersistence);
-          await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
-          return true;
-        } catch (retryErr: unknown) {
-          finalErr = retryErr;
+        for (const fallbackPersistence of [browserSessionPersistence, inMemoryPersistence]) {
+          try {
+            await setPersistence(auth, fallbackPersistence);
+            await signInWithPopup(auth, googleProvider);
+            return true;
+          } catch (retryErr: unknown) {
+            finalErr = retryErr;
+          }
         }
       }
 
       pendingDraftRef.current = null;
-      const code = (finalErr as {code?: string})?.code || '';
-      console.error('Google Sign-In error:', code, finalErr);
+      const code =
+        typeof (finalErr as {code?: unknown})?.code === 'string'
+          ? (finalErr as {code: string}).code
+          : '';
+      const rawMessage =
+        finalErr instanceof Error
+          ? finalErr.message
+          : typeof finalErr === 'string'
+            ? finalErr
+            : '';
+      const diagnosticTag = code || rawMessage.slice(0, 90) || 'erro-desconhecido';
+      console.error('Google Sign-In error:', diagnosticTag, finalErr);
 
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
         setAuthError('Login cancelado. Clique novamente para entrar com sua conta Google.');
       } else if (code === 'auth/popup-blocked') {
         setAuthError(
-          'O navegador bloqueou a janela do Google. Permita popups para este site e tente novamente.',
+          'O navegador bloqueou a janela do Google. Permita popups para este site ou use uma das opções abaixo.',
         );
       } else if (code === 'auth/unauthorized-domain') {
         const host = typeof window !== 'undefined' ? window.location.hostname : 'este domínio';
         setAuthError(
-          `Domínio não autorizado no Firebase Auth (${host}). Abra o app pelo endereço oficial ou autorize este domínio no console Firebase.`,
+          `Domínio não autorizado no Firebase Auth (${host}). Abra o app pelo link oficial ou autorize este domínio no console Firebase.`,
         );
       } else if (code === 'auth/network-request-failed') {
         setAuthError(
@@ -538,25 +574,47 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
         );
       } else if (code === 'auth/operation-not-allowed') {
         setAuthError(
-          'O provedor Google não está habilitado no Firebase Auth. Ative o login com Google nas configurações de autenticação.',
+          'O provedor Google não está habilitado no Firebase Auth. Ative o login com Google nas configurações do projeto.',
         );
       } else if (
         code === 'auth/internal-error' ||
         code === 'auth/web-storage-unsupported' ||
-        code === 'auth/operation-not-supported-in-this-environment'
+        code === 'auth/operation-not-supported-in-this-environment' ||
+        code === 'auth/missing-initial-state'
       ) {
         setAuthError(
-          'O navegador bloqueou cookies/armazenamento da janela do Google. Abra o app em uma aba própria fora do modo anônimo ou permita cookies de terceiros para entrar.',
+          `O navegador restringiu a janela de login do Google (${code}). Abra o app em uma nova aba ou use o login sem popup abaixo.`,
         );
       } else {
         setAuthError(
-          code
-            ? `Não foi possível concluir o login agora (${code}). Tente abrir o site em uma nova aba e entrar novamente.`
-            : 'Não foi possível concluir o login agora. Tente novamente.',
+          `Não foi possível concluir o login agora (${diagnosticTag}). Tente abrir o app em uma nova aba ou usar o botão abaixo.`,
         );
       }
       return false;
     } finally {
+      setAuthBusy(false);
+    }
+  }, []);
+
+  const signInWithGoogleRedirect = useCallback(async (draft?: PendingSignupDraft): Promise<void> => {
+    setAuthBusy(true);
+    setAuthError(null);
+    if (draft) {
+      try {
+        sessionStorage.setItem('megaachados_pending_signup_draft', JSON.stringify(draft));
+      } catch {
+        // Ignore storage errors
+      }
+    }
+    try {
+      await signInWithRedirect(auth, googleProvider);
+    } catch (err: unknown) {
+      const code =
+        typeof (err as {code?: unknown})?.code === 'string' ? (err as {code: string}).code : '';
+      const rawMessage = err instanceof Error ? err.message : String(err || '');
+      setAuthError(
+        `Não foi possível iniciar o redirecionamento Google (${code || rawMessage.slice(0, 90) || 'erro'}). Abra o app em uma nova aba do navegador.`,
+      );
       setAuthBusy(false);
     }
   }, []);
@@ -828,6 +886,7 @@ export const AuthProvider: React.FC<{children: React.ReactNode}> = ({children}) 
         adminSubscribers,
         clearAuthError: () => setAuthError(null),
         signInWithGoogle,
+        signInWithGoogleRedirect,
         updateUserProfile,
         toggleSaveDeal,
         isDealSaved,

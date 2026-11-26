@@ -71,6 +71,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     whatsappSubscription,
     clearAuthError,
     signInWithGoogle,
+    signInWithGoogleRedirect,
     updateUserProfile,
     toggleSaveDeal,
     saveWhatsappSubscription,
@@ -462,9 +463,46 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             )}
 
             {authError && (
-              <p className="text-xs font-medium text-red-600 dark:text-red-400 text-center">
-                {authError}
-              </p>
+              <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 space-y-2.5 text-center">
+                <p className="text-xs font-medium text-red-600 dark:text-red-400 leading-relaxed">
+                  {authError}
+                </p>
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-0.5">
+                  {typeof window !== 'undefined' && window.self !== window.top ? (
+                    <a
+                      href={window.location.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-full sm:w-auto min-h-[36px] px-3.5 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 transition-opacity"
+                    >
+                      <span>Abrir em nova aba para entrar</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={authBusy}
+                      onClick={() =>
+                        void signInWithGoogleRedirect(
+                          mode === 'signup'
+                            ? {
+                                displayName: displayName.trim().slice(0, 80) || undefined,
+                                preferredCategories: selectedCategories,
+                                whatsappPhone: signupPhone.trim()
+                                  ? normalizePhoneE164(signupPhone.trim()) || undefined
+                                  : undefined,
+                              }
+                            : undefined,
+                        )
+                      }
+                      className="w-full sm:w-auto min-h-[36px] px-3.5 rounded-lg bg-zinc-950 dark:bg-yellow-400 text-white dark:text-zinc-950 text-xs font-semibold inline-flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-60 transition-opacity"
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                      <span>Tentar login sem popup</span>
+                    </button>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         ) : (

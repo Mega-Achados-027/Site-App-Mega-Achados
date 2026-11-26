@@ -1,38 +1,11 @@
 import {initializeApp} from 'firebase/app';
-import {
-  GoogleAuthProvider,
-  browserLocalPersistence,
-  browserPopupRedirectResolver,
-  browserSessionPersistence,
-  getAuth,
-  inMemoryPersistence,
-  indexedDBLocalPersistence,
-  initializeAuth,
-  type Auth,
-} from 'firebase/auth';
+import {GoogleAuthProvider, getAuth} from 'firebase/auth';
 import {doc, getDocFromServer, getFirestore} from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-
-function createResilientAuth(): Auth {
-  try {
-    return initializeAuth(app, {
-      persistence: [
-        indexedDBLocalPersistence,
-        browserLocalPersistence,
-        browserSessionPersistence,
-        inMemoryPersistence,
-      ],
-      popupRedirectResolver: browserPopupRedirectResolver,
-    });
-  } catch {
-    return getAuth(app);
-  }
-}
-
-export const auth = createResilientAuth();
+export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({prompt: 'select_account'});
 
