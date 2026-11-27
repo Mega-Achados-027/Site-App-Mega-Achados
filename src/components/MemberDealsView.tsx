@@ -99,7 +99,7 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
     'Grupo WhatsApp de Ofertas';
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
-  const [onlyWithCoupon, setOnlyWithCoupon] = useState(true);
+  const [onlyWithCoupon, setOnlyWithCoupon] = useState(false);
   const [onlySaved, setOnlySaved] = useState(false);
   const [searching, setSearching] = useState(false);
   const [liveSearchLoading, setLiveSearchLoading] = useState(false);
@@ -159,9 +159,6 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
         const aTime = new Date(a.announcedAt).getTime();
         const bTime = new Date(b.announcedAt).getTime();
         if (Math.abs(bTime - aTime) >= 15000) return bTime - aTime;
-        const aHas = a.couponCode ? 1 : 0;
-        const bHas = b.couponCode ? 1 : 0;
-        if (aHas !== bHas) return bHas - aHas;
         return b.announcedDiscountPercent - a.announcedDiscountPercent;
       });
   }, [announcedDeals, nowMs, onlyWithCoupon, onlySaved, isDealSaved, categoryFilter, searchQuery]);
@@ -281,10 +278,10 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
         <div className="space-y-1.5">
           <h1 className="text-2xl sm:text-3xl font-extrabold text-zinc-950 dark:text-white tracking-normal">
-            Promoções com <span className="text-red-600 dark:text-yellow-400">Cupom Específico</span>
+            Melhores Promoções <span className="text-red-600 dark:text-yellow-400">em Tempo Real</span>
           </h1>
           <p className="text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed">
-            Novas ofertas inéditas entram automaticamente a cada 5 minutos sem repetir produtos e expiram após 3 horas. Pesquise qualquer produto para comparar preços e cupons em todas as lojas do app.
+            Ofertas com desconto direto e cupons ativos entram automaticamente a cada 5 minutos sem repetir produtos e expiram após 3 horas. Pesquise qualquer produto para comparar preços em todas as lojas do app.
           </p>
         </div>
 
@@ -396,7 +393,7 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
             }`}
           >
             <Ticket className="w-3.5 h-3.5" />
-            <span>Com cupom ({activeCouponDealsCount})</span>
+            <span>Só com cupom ({activeCouponDealsCount})</span>
           </button>
 
           {user && (
@@ -787,7 +784,7 @@ export const MemberDealsView: React.FC<MemberDealsViewProps> = ({
                 >
                   <Search className="w-3.5 h-3.5" />
                   <span>
-                    {searching ? 'Pesquisando ofertas com cupom...' : 'Buscar Ofertas com Cupom Agora'}
+                    {searching ? 'Pesquisando novas ofertas...' : 'Buscar Novas Ofertas Agora'}
                   </span>
                 </button>
               )}

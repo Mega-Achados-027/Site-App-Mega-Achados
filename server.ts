@@ -1671,6 +1671,11 @@ function pruneExpiredAndInvalidDeals(shouldBroadcast = false): boolean {
         changed = true;
         continue;
       }
+      // Reject any deal whose resolved URL slug contradicts the product's BTU/model/specs
+      if (!isUrlSlugConsistentWithTitle(deal.productName, deal.rawUrl)) {
+        changed = true;
+        continue;
+      }
       const freshAffiliateUrl = buildAffiliateUrl(deal.rawUrl, store);
       const fixedCategory = normalizeDealCategory(deal.category, deal.productName);
       const fixedImageUrl = (deal.imageUrl || '').replace(
@@ -1988,16 +1993,18 @@ async function fetchLiveAmazonDeals(opts: {
     if (!resp.ok) return [];
 
     const html = await resp.text();
-    const cards = html.split('data-component-type="s-search-result"').slice(1, 32);
+    const cards = html.split(/(?=<div[^>]+data-component-type="s-search-result")/i).slice(1, 34);
     const seenAsins = new Set<string>();
     const results: AnnouncedDeal[] = [];
 
     for (const card of cards) {
-      // Skip sponsored ads — keep only organic products with real /dp/{ASIN} URLs
-      const asinMatch = card.match(/\/dp\/([A-Z0-9]{10})/);
-      if (!asinMatch) continue;
-      const asin = asinMatch[1];
-      if (seenAsins.has(asin)) continue;
+      // Extract the card's OWN exact ASIN (from data-asin or the main h2 product link — never a sibling variant swatch)
+      const dataAsinMatch = card.match(/data-asin="([A-Z0-9]{10})"/i);
+      const h2LinkAsinMatch = card.match(
+        /href="[^"]*\/dp\/([A-Z0-9]{10})[^"]*"[^>]*>\s*(?:<span[^>]*>)?\s*<h2/i,
+      );
+      const asin = (h2LinkAsinMatch?.[1] || dataAsinMatch?.[1] || '').toUpperCase();
+      if (!asin || seenAsins.has(asin)) continue;
 
       const titleMatch = card.match(/<h2[^>]*aria-label="([^"]+)"/);
       if (!titleMatch) continue;
@@ -2236,6 +2243,11 @@ const PROMOBIT_COUPON_ROUTES: Array<{path: string; category: string; keywords: s
     category: 'Smartphones',
     keywords: ['iphone', 'apple', 'ios', 'airpods', 'ipad', 'macbook'],
   },
+  {
+    path: '/cupons/loja/mercado-livre/',
+    category: 'Destaques',
+    keywords: ['mercado livre', 'mercadolivre', 'meli', 'full'],
+  },
 ];
 
 function cleanProductTitleForStoreSearch(rawTitle: string): string {
@@ -2332,21 +2344,29 @@ async function fetchPromobitPageCouponOffers(opts: {
       const price = Number(item.offerPrice || 0);
       const rawCoupon = stripHtmlTags(String(item.offerCoupon || '')).trim();
 
-      // Skip generic "Cupom 25% OFF..." posts or non-product entries without real product pricing
-      if (!rawTitle || price < 20 || !rawCoupon || rawCoupon.length < 3) continue;
-      if (/^cupom\s+/i.test(rawTitle) || /resgate|sem cupom|ativar no link/i.test(rawCoupon)) continue;
+      // Skip generic coupon-only announcements, group invites, or entries without real product pricing
+      if (!rawTitle || price < 20) continue;
+      if (/^cupom\s+/i.test(rawTitle) || /grupo\s+do\s+promobit|whatsapp|telegram/i.test(rawTitle)) {
+        continue;
+      }
 
       const store = matchConfiguredStore(activeStores, item.storeDomain, item.storeName);
       if (!store) continue;
 
       seenIds.add(offerId);
 
+      // Keep coupon info ONLY when this specific offer actually has a valid coupon (direct non-coupon deals are equally welcome!)
+      const hasRawCoupon =
+        rawCoupon.length >= 3 && !/resgate|sem cupom|ativar no link/i.test(rawCoupon);
       const isPageActivation =
-        /\s/.test(rawCoupon) || /p[aá]gina|clicar|resgatar|marcar|an[uú]ncio/i.test(rawCoupon);
-      const cleanCode = isPageActivation
-        ? rawCoupon.slice(0, 32)
-        : rawCoupon.toUpperCase().replace(/[^A-Z0-9_-]/g, '');
-      if (!cleanCode || cleanCode.length < 3) continue;
+        hasRawCoupon &&
+        (/\s/.test(rawCoupon) || /p[aá]gina|clicar|resgatar|marcar|an[uú]ncio/i.test(rawCoupon));
+      const cleanCode = hasRawCoupon
+        ? isPageActivation
+          ? rawCoupon.slice(0, 32)
+          : rawCoupon.toUpperCase().replace(/[^A-Z0-9_-]/g, '')
+        : '';
+      const validCouponCode = cleanCode.length >= 3 ? cleanCode : undefined;
 
       const rawOldPrice = Number(item.offerOldPrice || 0);
       const rawPct = Number(item.offerDiscontPercentage || 0);
@@ -2375,7 +2395,7 @@ async function fetchPromobitPageCouponOffers(opts: {
       const brand = rawTitle.split(' ')[0] || store.name;
 
       results.push({
-        id: `deal-cpn-${store.id}-${offerId}`,
+        id: `deal-${validCouponCode ? 'cpn' : 'promo'}-${store.id}-${offerId}`,
         productId: `promo-${offerId}`,
         productName: rawTitle.slice(0, 120),
         category,
@@ -2392,14 +2412,178 @@ async function fetchPromobitPageCouponOffers(opts: {
         affiliateUrl: buildAffiliateUrl(rawUrl, store),
         verifiedByManualSearch: true,
         isLiveDiscovered: true,
-        couponCode: cleanCode,
-        couponLabel: isPageActivation
-          ? 'Cupom direto na página deste produto'
-          : 'Cupom verificado para este produto',
-        couponRule: isPageActivation
-          ? `Marque a caixa de cupom no anúncio da ${store.name} antes de finalizar.`
-          : `Aplique o cupom ${cleanCode} no carrinho da ${store.name} para este item.`,
-        couponIsPageActivation: isPageActivation,
+        ...(validCouponCode
+          ? {
+              couponCode: validCouponCode,
+              couponLabel: isPageActivation
+                ? 'Cupom direto na página deste produto'
+                : 'Cupom verificado para este produto',
+              couponRule: isPageActivation
+                ? `Marque a caixa de cupom no anúncio da ${store.name} antes de finalizar.`
+                : `Aplique o cupom ${validCouponCode} no carrinho da ${store.name} para este item.`,
+              couponIsPageActivation: isPageActivation,
+            }
+          : {}),
+        announcedAt: nowIso,
+        expiresAt: expiresIso,
+        lastVerifiedAt: nowIso,
+      });
+    }
+
+    return results;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface PechinchouPromoEntry {
+  id?: number | string;
+  title?: string;
+  price?: number | string;
+  old_price?: number | string;
+  image?: string;
+  short_url?: string;
+  long_url?: string;
+  status?: string;
+  coupons?: string[];
+  discount_coupon?: string | null;
+  store?: {
+    name?: string;
+    slug?: string;
+    slug_url?: string;
+  };
+  subcategory?: {
+    name?: string;
+    category?: {name?: string};
+  };
+}
+
+async function fetchLivePechinchouMercadoLivreDeals(opts: {
+  store: StoreConfig;
+  query?: string;
+  fallbackCategory?: string;
+  nowIso: string;
+  expiresIso: string;
+}): Promise<AnnouncedDeal[]> {
+  const {store, query, fallbackCategory, nowIso, expiresIso} = opts;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
+
+  try {
+    const resp = await fetch('https://pechinchou.com.br/lojas/mercado-livre', {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      signal: controller.signal,
+    });
+    if (!resp.ok) return [];
+
+    const html = await resp.text();
+    const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!match) return [];
+
+    const parsed = JSON.parse(match[1]) as {
+      props?: {
+        pageProps?: {
+          products?: {results?: PechinchouPromoEntry[]} | PechinchouPromoEntry[];
+          promos?: {results?: PechinchouPromoEntry[]} | PechinchouPromoEntry[];
+        };
+      };
+    };
+    const pp = parsed?.props?.pageProps;
+    const rawList: PechinchouPromoEntry[] = Array.isArray(pp?.products)
+      ? pp.products
+      : Array.isArray(pp?.products?.results)
+        ? pp.products.results
+        : Array.isArray(pp?.promos)
+          ? pp.promos
+          : Array.isArray(pp?.promos?.results)
+            ? pp.promos.results
+            : [];
+
+    const qTokens = query ? normalizeSearchTokens(query) : [];
+    const seenIds = new Set<string>();
+    const results: AnnouncedDeal[] = [];
+
+    for (const item of rawList) {
+      const idStr = String(item.id || '').trim();
+      if (!idStr || seenIds.has(idStr)) continue;
+      if (item.status && String(item.status).toUpperCase() !== 'ACTIVE') continue;
+
+      const storeHint = `${item.store?.name || ''} ${item.store?.slug || ''} ${item.store?.slug_url || ''}`.toLowerCase();
+      if (storeHint.trim() && !storeHint.includes('mercado')) continue;
+
+      const rawTitle = stripHtmlTags(String(item.title || '')).trim();
+      const price = Number(item.price || 0);
+      if (!rawTitle || price < 20) continue;
+      if (/^cupom\s+/i.test(rawTitle) || /whatsapp|telegram|grupo/i.test(rawTitle)) continue;
+
+      const candidateUrl = String(item.long_url || item.short_url || '').trim();
+      if (!candidateUrl || !/^https?:\/\//i.test(candidateUrl)) continue;
+      if (!/meli\.la|mercadolivre\.com\.br|mercadolibre\./i.test(candidateUrl)) continue;
+
+      if (qTokens.length > 0) {
+        const hay = rawTitle
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '');
+        if (!qTokens.every((t) => hay.includes(t))) continue;
+      }
+
+      seenIds.add(idStr);
+
+      const rawOldPrice = Number(item.old_price || 0);
+      const referencePrice =
+        rawOldPrice > price * 1.03 ? rawOldPrice : Number((price * 1.2).toFixed(2));
+      const discountPercent = Math.max(
+        5,
+        Number((((referencePrice - price) / referencePrice) * 100).toFixed(1)),
+      );
+
+      const firstCoupon =
+        (Array.isArray(item.coupons) && item.coupons[0] ? String(item.coupons[0]) : '') ||
+        String(item.discount_coupon || '');
+      const cleanCoupon = firstCoupon
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9_-]/g, '');
+      const validCouponCode = cleanCoupon.length >= 3 && cleanCoupon.length <= 28 ? cleanCoupon : undefined;
+
+      const subCatHint = item.subcategory?.category?.name || item.subcategory?.name || fallbackCategory || 'Ofertas';
+      const category = mapRetailerCategory(rawTitle, subCatHint);
+      const brand = rawTitle.split(' ')[0] || store.name;
+      const imageUrl = String(item.image || '').trim();
+
+      results.push({
+        id: `deal-${validCouponCode ? 'cpn' : 'promo'}-${store.id}-pch-${idStr}`,
+        productId: `pechinchou-ml-${idStr}`,
+        productName: rawTitle.slice(0, 120),
+        category,
+        brand,
+        imageUrl,
+        storeId: store.id,
+        storeName: store.name,
+        announcedPrice: Math.round(price * 100) / 100,
+        referencePrice: Math.round(referencePrice * 100) / 100,
+        announcedDiscountPercent: discountPercent,
+        installments: `${store.installmentsInfo} de R$ ${(price / 10).toFixed(2).replace('.', ',')}`,
+        shipping: store.defaultShipping,
+        rawUrl: candidateUrl,
+        affiliateUrl: buildAffiliateUrl(candidateUrl, store),
+        verifiedByManualSearch: true,
+        isLiveDiscovered: true,
+        ...(validCouponCode
+          ? {
+              couponCode: validCouponCode,
+              couponLabel: 'Cupom verificado para este produto',
+              couponRule: `Aplique o cupom ${validCouponCode} no carrinho da ${store.name} para este item.`,
+              couponIsPageActivation: false,
+            }
+          : {}),
         announcedAt: nowIso,
         expiresAt: expiresIso,
         lastVerifiedAt: nowIso,
@@ -2706,13 +2890,19 @@ async function manualSearchAndAnnounceDeals(opts?: {
       }
     }
 
+    const mlStore = activeStores.find((s) => s.id === 'mercadolivre');
+    const mlRoute = PROMOBIT_COUPON_ROUTES.find((r) => r.path === '/cupons/loja/mercado-livre/');
+    if (mlRoute && mlStore && !selectedRoutes.some((r) => r.path === mlRoute.path)) {
+      selectedRoutes.push(mlRoute);
+    }
+
     const effectiveSearchTerm =
       qRaw ||
       (cat && cat !== 'all' ? CATEGORY_TO_SEARCH_QUERY[cat] || cat : rotatingTopic.query);
     const effectiveFallbackCategory =
       cat && cat !== 'all' ? cat : rotatingTopic.category;
 
-    const [promobitBatches, liveAmazonRaw, liveKabumRaw] = await Promise.all([
+    const [promobitBatches, liveMlRaw, liveAmazonRaw, liveKabumRaw] = await Promise.all([
       Promise.all(
         selectedRoutes.map((route) =>
           fetchPromobitPageCouponOffers({
@@ -2724,6 +2914,15 @@ async function manualSearchAndAnnounceDeals(opts?: {
           }),
         ),
       ),
+      mlStore && passIndex === 0
+        ? fetchLivePechinchouMercadoLivreDeals({
+            store: mlStore,
+            query: qRaw || undefined,
+            fallbackCategory: effectiveFallbackCategory,
+            nowIso,
+            expiresIso,
+          })
+        : Promise.resolve([]),
       amazonStore
         ? fetchLiveAmazonDeals({
             query: effectiveSearchTerm,
@@ -2746,12 +2945,13 @@ async function manualSearchAndAnnounceDeals(opts?: {
 
     checkedCount +=
       promobitBatches.reduce((sum, b) => sum + b.length, 0) +
+      liveMlRaw.length +
       liveAmazonRaw.length +
       liveKabumRaw.length;
 
     const seenPromoIds = new Set<string>();
     const promobitDeals: AnnouncedDeal[] = [];
-    for (const batch of promobitBatches) {
+    for (const batch of [liveMlRaw, ...promobitBatches]) {
       for (const deal of batch) {
         if (seenPromoIds.has(deal.productId)) continue;
         if (qTokens.length > 0) {
@@ -2768,18 +2968,18 @@ async function manualSearchAndAnnounceDeals(opts?: {
       }
     }
 
+    // Prioritize best real discount across Mercado Livre (direct Pechinchou meli.la links first) and other stores
     promobitDeals.sort((a, b) => {
-      const aCode = a.couponIsPageActivation ? 0 : 1;
-      const bCode = b.couponIsPageActivation ? 0 : 1;
-      if (aCode !== bCode) return bCode - aCode;
+      const aDirectMl = a.storeId === 'mercadolivre' && /meli\.la/i.test(a.rawUrl) ? 2 : a.storeId === 'mercadolivre' ? 1 : 0;
+      const bDirectMl = b.storeId === 'mercadolivre' && /meli\.la/i.test(b.rawUrl) ? 2 : b.storeId === 'mercadolivre' ? 1 : 0;
+      if (aDirectMl !== bDirectMl) return bDirectMl - aDirectMl;
       return b.announcedDiscountPercent - a.announcedDiscountPercent;
     });
 
     const liveAmazon = liveAmazonRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
     const liveKabum = liveKabumRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
 
-    const retailWithCoupon: AnnouncedDeal[] = [];
-    const retailWithoutCoupon: AnnouncedDeal[] = [];
+    const retailBestDeals: AnnouncedDeal[] = [];
     const maxRetail = Math.max(liveAmazon.length, liveKabum.length);
     for (let i = 0; i < maxRetail; i++) {
       for (const candidate of [liveAmazon[i], liveKabum[i]]) {
@@ -2788,15 +2988,12 @@ async function manualSearchAndAnnounceDeals(opts?: {
           cat && cat !== 'all' && candidate.category !== cat
             ? {...candidate, category: cat}
             : candidate;
-        if (adjusted.couponCode) {
-          retailWithCoupon.push(adjusted);
-        } else {
-          retailWithoutCoupon.push(adjusted);
-        }
+        retailBestDeals.push(adjusted);
       }
     }
+    retailBestDeals.sort((a, b) => b.announcedDiscountPercent - a.announcedDiscountPercent);
 
-    // Resolve Promobit candidates to REAL direct store product URLs before accepting them
+    // Resolve Promobit & Pechinchou ML candidates to REAL exact product URLs
     const promobitCandidates = promobitDeals.filter((item) => !isDuplicateForCycle(item));
     const resolvedPromobit = await ensureDirectProductUrlsForDeals(
       promobitCandidates,
@@ -2805,10 +3002,7 @@ async function manualSearchAndAnnounceDeals(opts?: {
     );
 
     pushUnique(resolvedPromobit, 10);
-    pushUnique(retailWithCoupon, 12);
-    if (combinedFresh.length < 6) {
-      pushUnique(retailWithoutCoupon, 12);
-    }
+    pushUnique(retailBestDeals, 12);
   };
 
   await runDiscoveryPass(0);
@@ -2872,15 +3066,14 @@ async function publishScheduledDealBatch(): Promise<void> {
     const amazonStore = activeStores.find((s) => s.domain.toLowerCase().includes('amazon.'));
     const kabumStore = activeStores.find((s) => s.domain.toLowerCase().includes('kabum.'));
 
-    // Drop 3 brand-new, never-previously-published product+coupon deals every 5 minutes (or up to 6 if feed was empty)
-    const dropSize = state.announcedDeals.length === 0 ? 6 : 3;
+    // Drop 4 brand-new never-previously-published deals every 5 minutes (or up to 8 if feed is low/empty)
+    const dropSize = state.announcedDeals.length < 6 ? 8 : 4;
     const freshCandidates: AnnouncedDeal[] = [];
     const seenNewIds = new Set<string>();
     const seenNewFp = new Set<string>();
 
     const collectNeverRepeated = (list: AnnouncedDeal[]) => {
       for (const d of list) {
-        if (!d.couponCode) continue;
         if (seenNewIds.has(d.productId)) continue;
         const fp = normalizeProductFingerprint(d.productName);
         if (fp && seenNewFp.has(fp)) continue;
@@ -2893,6 +3086,8 @@ async function publishScheduledDealBatch(): Promise<void> {
     };
 
     const directOnlyFallback: AnnouncedDeal[] = [];
+    const mlRoute = PROMOBIT_COUPON_ROUTES.find((r) => r.path === '/cupons/loja/mercado-livre/');
+    const mlStore = activeStores.find((s) => s.id === 'mercadolivre');
 
     // Run up to 3 rotating passes if earlier routes only had already-published products
     for (let pass = 0; pass < 3 && freshCandidates.length < dropSize * 2; pass++) {
@@ -2905,8 +3100,11 @@ async function publishScheduledDealBatch(): Promise<void> {
         PROMOBIT_COUPON_ROUTES[(routeOffset + 1) % PROMOBIT_COUPON_ROUTES.length],
         PROMOBIT_COUPON_ROUTES[(routeOffset + 2) % PROMOBIT_COUPON_ROUTES.length],
       ];
+      if (pass === 0 && mlStore && mlRoute && !selectedRoutes.some((r) => r.path === mlRoute.path)) {
+        selectedRoutes.unshift(mlRoute);
+      }
 
-      const [promobitBatches, liveAmazonRaw, liveKabumRaw] = await Promise.all([
+      const [promobitBatches, liveMlRaw, liveAmazonRaw, liveKabumRaw] = await Promise.all([
         Promise.all(
           selectedRoutes.map((route) =>
             fetchPromobitPageCouponOffers({
@@ -2918,6 +3116,14 @@ async function publishScheduledDealBatch(): Promise<void> {
             }),
           ),
         ),
+        pass === 0 && mlStore
+          ? fetchLivePechinchouMercadoLivreDeals({
+              store: mlStore,
+              fallbackCategory: rotatingTopic.category,
+              nowIso,
+              expiresIso,
+            })
+          : Promise.resolve([]),
         amazonStore
           ? fetchLiveAmazonDeals({
               query: rotatingTopic.query,
@@ -2938,20 +3144,20 @@ async function publishScheduledDealBatch(): Promise<void> {
           : Promise.resolve([]),
       ]);
 
-      const promoFlat = promobitBatches.flat().sort((a, b) => {
-        const aCode = a.couponIsPageActivation ? 0 : 1;
-        const bCode = b.couponIsPageActivation ? 0 : 1;
-        if (aCode !== bCode) return bCode - aCode;
+      const promoFlat = [...liveMlRaw, ...promobitBatches.flat()].sort((a, b) => {
+        const aDirectMl = a.storeId === 'mercadolivre' && /meli\.la/i.test(a.rawUrl) ? 2 : a.storeId === 'mercadolivre' ? 1 : 0;
+        const bDirectMl = b.storeId === 'mercadolivre' && /meli\.la/i.test(b.rawUrl) ? 2 : b.storeId === 'mercadolivre' ? 1 : 0;
+        if (aDirectMl !== bDirectMl) return bDirectMl - aDirectMl;
         return b.announcedDiscountPercent - a.announcedDiscountPercent;
       });
       collectNeverRepeated(promoFlat);
-      const amazonWithCoupons = liveAmazonRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
-      const kabumWithCoupons = liveKabumRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
-      collectNeverRepeated(amazonWithCoupons);
-      collectNeverRepeated(kabumWithCoupons);
+      const amazonDeals = liveAmazonRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
+      const kabumDeals = liveKabumRaw.map((d) => attachEligibleLiveCouponToDeal(d, state.coupons));
+      collectNeverRepeated(amazonDeals);
+      collectNeverRepeated(kabumDeals);
 
       // Keep direct-URL Amazon/KaBuM deals as backup in case Promobit candidates cannot resolve
-      for (const d of [...amazonWithCoupons, ...kabumWithCoupons]) {
+      for (const d of [...amazonDeals, ...kabumDeals]) {
         if (!isStoreSearchUrl(d.rawUrl) && !isProductAlreadyPublished(d, historySet)) {
           directOnlyFallback.push(d);
         }
@@ -3037,6 +3243,249 @@ function scoreTitleMatch(queryTokens: string[], title: string): number {
     if (norm.includes(tok)) hits++;
   }
   return hits / queryTokens.length;
+}
+
+const GENERIC_SPEC_TOKENS = new Set([
+  '110v',
+  '127v',
+  '220v',
+  '240v',
+  'bivolt',
+  '5g',
+  '4g',
+  '3g',
+  '4k',
+  '8k',
+  '2k',
+  'r32',
+  'r410a',
+  'wifi',
+  'wifi6',
+  'wifi6e',
+  'am4',
+  'am5',
+  'lga1700',
+  'lga1200',
+  'ddr4',
+  'ddr5',
+  'usb',
+  'usbc',
+  'hdmi',
+  'hdmi2',
+  'rgb',
+  'argb',
+  'led',
+  'oled',
+  'qled',
+  'ips',
+  'va',
+  'fhd',
+  'qhd',
+  'uhd',
+  'uwqhd',
+  '60hz',
+  '75hz',
+  '100hz',
+  '120hz',
+  '144hz',
+  '165hz',
+  '180hz',
+  '240hz',
+  '360hz',
+  '1ms',
+  'ip67',
+  'ip68',
+  'bt5',
+  'pcie4',
+  'pcie5',
+  'm2',
+  'nvme',
+  'ssd',
+]);
+
+function normalizeSpecText(input: string): string {
+  return input
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    // Normalize Brazilian thousands dots like 12.000 -> 12000, 9.000 -> 9000
+    .replace(/(\d)\.(\d{3})\b/g, '$1$2')
+    // Normalize "12 mil btu" / "9 mil btus" -> "12000 btu"
+    .replace(/\b(\d{1,2})\s*mil\s*btu/g, (_, n: string) => `${Number(n) * 1000} btu`)
+    .replace(/\b(\d{1,2})k\s*btu/g, (_, n: string) => `${Number(n) * 1000} btu`)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractBtuValues(norm: string): number[] {
+  const out = new Set<number>();
+  for (const m of norm.matchAll(/\b(\d{4,5})\s*btu/g)) {
+    const val = Number(m[1]);
+    if (val >= 5000 && val <= 90000) out.add(val);
+  }
+  return Array.from(out);
+}
+
+function extractUnitClassValues(norm: string, unitRegex: RegExp): string[] {
+  const out = new Set<string>();
+  for (const m of norm.matchAll(unitRegex)) {
+    if (m[1]) out.add(m[1].toLowerCase());
+  }
+  return Array.from(out);
+}
+
+/**
+ * Strictly validates that a candidate product title or URL slug matches the expected product's
+ * critical identifiers: BTU capacities, CPU/GPU tiers (Ryzen 7 5800X3D vs Ryzen 3 2600G),
+ * smartphone generations, storage/RAM/size capacities, and alphanumeric model codes.
+ */
+function isExactProductSpecMatch(expectedTitle: string, candidateText: string): boolean {
+  const exp = normalizeSpecText(expectedTitle);
+  const cand = normalizeSpecText(candidateText);
+  if (!exp || !cand) return false;
+
+  // 1. BTU exact check (9000 vs 12000 vs 18000 vs 22000 vs 24000)
+  const expBtus = extractBtuValues(exp);
+  const candBtus = extractBtuValues(cand);
+  if (expBtus.length > 0) {
+    if (candBtus.length > 0 && !expBtus.some((b) => candBtus.includes(b))) {
+      return false;
+    }
+    if (candBtus.length === 0 && !expBtus.some((b) => new RegExp(`\\b${b}\\b`).test(cand))) {
+      return false;
+    }
+  }
+
+  // 2. CPU series tier check (Ryzen 3/5/7/9, Core i3/i5/i7/i9, Core Ultra 5/7/9)
+  const expRyzen = exp.match(/\bryzen\s*([3579])\b/)?.[1];
+  const candRyzen = cand.match(/\bryzen\s*([3579])\b/)?.[1];
+  if (expRyzen && candRyzen && expRyzen !== candRyzen) return false;
+  if (expRyzen && !candRyzen && /\bryzen\b/.test(cand)) return false;
+
+  const expCoreI = exp.match(/\b(?:core\s*)?i([3579])\b/)?.[1];
+  const candCoreI = cand.match(/\b(?:core\s*)?i([3579])\b/)?.[1];
+  if (expCoreI && candCoreI && expCoreI !== candCoreI) return false;
+
+  const expUltra = exp.match(/\bultra\s*([579])\b/)?.[1];
+  const candUltra = cand.match(/\bultra\s*([579])\b/)?.[1];
+  if (expUltra && candUltra && expUltra !== candUltra) return false;
+
+  // 3. Smartphone / Console generation check
+  const expIphone = exp.match(/\biphone\s*(\d{2})\b/)?.[1];
+  const candIphone = cand.match(/\biphone\s*(\d{2})\b/)?.[1];
+  if (expIphone && candIphone && expIphone !== candIphone) return false;
+  if (expIphone && !candIphone) return false;
+
+  const expGalaxy = exp.match(/\bgalaxy\s+(?:tab\s+)?([aszm]\d{2})\b/)?.[1];
+  const candGalaxy = cand.match(/\bgalaxy\s+(?:tab\s+)?([aszm]\d{2})\b/)?.[1];
+  if (expGalaxy && candGalaxy && expGalaxy !== candGalaxy) return false;
+  if (expGalaxy && !new RegExp(`\\b${expGalaxy}\\b`).test(cand)) return false;
+
+  // 4. Strong alphanumeric model codes with >= 3 digits (e.g. 5800x3d, 7800x3d, 2600g, 4060ti, 14700k, wd11m)
+  const expTokens = exp.split(' ');
+  const candTokenSet = new Set(cand.split(' '));
+  const isStrongModelCode = (tok: string): boolean => {
+    if (GENERIC_SPEC_TOKENS.has(tok)) return false;
+    if (/^\d+(?:gb|tb|mb|kg|ml|mm|cm|hz|khz|mhz|ghz|mah|wh|w|v|l|pol|btu|btus|btuh)$/.test(tok)) {
+      return false;
+    }
+    const hasLetter = /[a-z]/.test(tok);
+    const digitCount = (tok.match(/\d/g) || []).length;
+    return hasLetter && digitCount >= 3 && tok.length >= 4;
+  };
+
+  const expStrongCodes = expTokens.filter(isStrongModelCode);
+  const candStrongCodes = cand.split(' ').filter(isStrongModelCode);
+
+  for (const code of expStrongCodes) {
+    // Allow prefix match for sub-variants only if same base (e.g. 5800x3d MUST match 5800x3d, NOT 5800x or 2600g)
+    if (!candTokenSet.has(code) && !cand.includes(code)) {
+      return false;
+    }
+  }
+  // Reject if candidate has a conflicting CPU/GPU 4-digit+ alphanumeric model code (e.g. 2600g when expected is 5800x3d)
+  for (const cCode of candStrongCodes) {
+    if (/^\d{4}[a-z0-9]{1,3}$/.test(cCode) && expStrongCodes.length > 0 && !exp.includes(cCode)) {
+      return false;
+    }
+  }
+
+  // 5. Pure 4-digit+ model/capacity numbers in expected title (e.g. 5800, 7800, 4060, 4070, 9000, 12000, 18000, 22000)
+  const expBigNums = expTokens.filter((t) => {
+    if (!/^\d{4,5}$/.test(t)) return false;
+    const n = Number(t);
+    if (n >= 2020 && n <= 2030) return false; // Ignore model years
+    return true;
+  });
+  for (const numTok of expBigNums) {
+    if (!candTokenSet.has(numTok) && !new RegExp(`\\b${numTok}\\b`).test(cand)) {
+      return false;
+    }
+  }
+
+  // 6. Capacity conflicts when BOTH sides mention the same unit (storage GB/TB, kg, liters)
+  const unitChecks: RegExp[] = [
+    /\b(\d{2,4}\s*(?:gb|tb))\b/g,
+    /\b(\d{1,2}\s*kg)\b/g,
+    /\b(\d{1,3}\s*l)\b/g,
+  ];
+  for (const rx of unitChecks) {
+    const expVals = extractUnitClassValues(exp, rx).map((v) => v.replace(/\s+/g, ''));
+    const candVals = extractUnitClassValues(cand, rx).map((v) => v.replace(/\s+/g, ''));
+    if (expVals.length > 0 && candVals.length > 0) {
+      if (!expVals.some((v) => candVals.includes(v))) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Checks whether a resolved store URL's readable slug contradicts the deal title's key specs
+ * (e.g. a 9000 BTU deal pointing to a /22000-btus/ product URL). URLs without descriptive slugs
+ * (like /dp/B0... or /produto/12345) pass through because they are verified by candidate title.
+ */
+function isUrlSlugConsistentWithTitle(productTitle: string, rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const pathText = decodeURIComponent(parsed.pathname).replace(/[-_/]+/g, ' ').trim();
+    // Skip short ID-only paths (/dp/B0..., /produto/426262, /p/MLB123456)
+    const words = pathText.split(/\s+/).filter((w) => w.length >= 3 && !/^(dp|produto|mlb\d+|p)$/i.test(w));
+    if (words.length < 3) return true;
+
+    const exp = normalizeSpecText(productTitle);
+    const slug = normalizeSpecText(pathText);
+
+    // BTU conflict in URL slug
+    const expBtus = extractBtuValues(exp);
+    const slugBtus = extractBtuValues(slug);
+    if (expBtus.length > 0 && slugBtus.length > 0 && !expBtus.some((b) => slugBtus.includes(b))) {
+      return false;
+    }
+
+    // Ryzen / Core i tier conflict in URL slug
+    const expRyzen = exp.match(/\bryzen\s*([3579])\b/)?.[1];
+    const slugRyzen = slug.match(/\bryzen\s*([3579])\b/)?.[1];
+    if (expRyzen && slugRyzen && expRyzen !== slugRyzen) return false;
+
+    const expCoreI = exp.match(/\b(?:core\s*)?i([3579])\b/)?.[1];
+    const slugCoreI = slug.match(/\b(?:core\s*)?i([3579])\b/)?.[1];
+    if (expCoreI && slugCoreI && expCoreI !== slugCoreI) return false;
+
+    // 4-digit model code conflict in URL slug (e.g. 5800x3d vs 2600g)
+    const expCodes = exp.split(' ').filter((t) => /^\d{4}[a-z0-9]{1,3}$/.test(t));
+    const slugCodes = slug.split(' ').filter((t) => /^\d{4}[a-z0-9]{1,3}$/.test(t));
+    if (expCodes.length > 0 && slugCodes.length > 0 && !expCodes.some((c) => slugCodes.includes(c))) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return true;
+  }
 }
 
 function isSafePublicRetailHost(hostname: string): boolean {
@@ -3205,9 +3654,10 @@ function extractDirectMlProductUrlFromSocialHtml(
   productTitle: string,
   store: StoreConfig,
 ): string | null {
+  const normalizedHtml = html.replace(/\\\//g, '/').replace(/\\u002F/gi, '/');
   const matches = [
-    ...html.matchAll(
-      /https?:\/\/(?:www\.|produto\.)?mercadolivre\.com\.br\/[^"'\s<>\\]+(?:\/p\/MLB\d+|\/MLB-?\d{6,})[^"'\s<>\\]*/gi,
+    ...normalizedHtml.matchAll(
+      /https?:\/\/(?:www\.|produto\.)?mercadolivre\.com\.br(?:\/[^"'\s<>\\]*\/p\/MLB\d+|\/MLB-?\d{6,})[^"'\s<>\\]*/gi,
     ),
   ];
   if (matches.length === 0) return null;
@@ -3224,8 +3674,13 @@ function extractDirectMlProductUrlFromSocialHtml(
     if (!canonical || seen.has(canonical)) continue;
     seen.add(canonical);
 
-    const pathScore = scoreTitleMatch(titleTokens, canonical.replace(/[-/]+/g, ' '));
-    const totalScore = pathScore + (isFeaturedCard ? 0.65 : 0);
+    const slugText = canonical.replace(/[-/]+/g, ' ');
+    const pathScore = scoreTitleMatch(titleTokens, slugText);
+    // Require genuine match + exact spec consistency (never pick unrelated products from /social/.../lists)
+    if (pathScore < 0.35) continue;
+    if (!isExactProductSpecMatch(productTitle, slugText)) continue;
+
+    const totalScore = pathScore + (isFeaturedCard ? 0.5 : 0);
     if (totalScore > bestScore) {
       bestScore = totalScore;
       bestUrl = canonical;
@@ -3400,10 +3855,22 @@ async function resolveDirectProductUrlForDeal(opts: {
 
   let resolved: string | null = null;
 
+  // 1.5 If candidateUrl is already a real store shortlink (e.g. meli.la, amzn.to, magalu.lu, s.shopee.com.br), unwrap it directly!
+  if (
+    candidateUrl &&
+    /^https?:\/\/(?:meli\.la|amzn\.to|magalu\.lu|s\.shopee\.com\.br|shope\.ee|mercadolivre\.com\/sec)\//i.test(
+      candidateUrl,
+    )
+  ) {
+    resolved = await unwrapShortlinkToDirectStoreUrl(candidateUrl, store, productTitle);
+  }
+
   // 2. If this offer originated from Promobit (productId = "promo-{offerId}"), extract its exact store destination!
-  const promoMatch = String(productId || '').match(/^promo-(\d+)$/);
-  if (promoMatch?.[1]) {
-    resolved = await resolveDirectProductUrlFromPromobit(promoMatch[1], store, productTitle);
+  if (!resolved) {
+    const promoMatch = String(productId || '').match(/^promo-(\d+)$/);
+    if (promoMatch?.[1]) {
+      resolved = await resolveDirectProductUrlFromPromobit(promoMatch[1], store, productTitle);
+    }
   }
 
   // 3. Store-direct fallbacks (work seamlessly even if Promobit throttles 429 or returns a generic page)
@@ -3416,23 +3883,26 @@ async function resolveDirectProductUrlForDeal(opts: {
 
     if (storeDom.includes('amazon.')) {
       const amz = await fetchLiveAmazonSearchOffer(cleanQuery, store);
-      if (amz?.rawUrl) {
+      if (amz?.rawUrl && isExactProductSpecMatch(productTitle, amz.productTitle)) {
         resolved = canonicalizeDirectStoreProductUrl(amz.rawUrl, store, productTitle);
       }
     } else if (storeDom.includes('kabum.')) {
       const kb = await fetchLiveKabumSearchOffer(cleanQuery, store);
-      if (kb?.rawUrl) {
+      if (kb?.rawUrl && isExactProductSpecMatch(productTitle, kb.productTitle)) {
         resolved = canonicalizeDirectStoreProductUrl(kb.rawUrl, store, productTitle);
       }
     }
 
-    // Cross-store comparator lead unwrap (great for Magazine Luiza, Mercado Livre, Casas Bahia, and backup for Amazon/KaBuM)
+    // Cross-store comparator lead unwrap (strictly verified against product specs & URL slug)
     if (!resolved && cleanQuery.length >= 4) {
       try {
         const comp = await fetchBuscapeCrossStoreOffers(cleanQuery, [store]);
         const match = comp.byStoreId.get(store.id);
-        if (match?.rawUrl) {
-          resolved = canonicalizeDirectStoreProductUrl(match.rawUrl, store, productTitle);
+        if (match?.rawUrl && isExactProductSpecMatch(productTitle, match.productTitle)) {
+          const candUrl = canonicalizeDirectStoreProductUrl(match.rawUrl, store, productTitle);
+          if (candUrl && isUrlSlugConsistentWithTitle(productTitle, candUrl)) {
+            resolved = candUrl;
+          }
         }
       } catch {
         // Fallback silently
@@ -3677,7 +4147,13 @@ async function fetchComparatorCrossStoreOffers(
     const qTokens = normalizeSearchTokens(query);
 
     const scoredHits = hits
-      .filter((h) => h.url && Number(h.price) > 0 && !isUnwantedAccessoryTitle(query, String(h.name || '')))
+      .filter(
+        (h) =>
+          h.url &&
+          Number(h.price) > 0 &&
+          !isUnwantedAccessoryTitle(query, String(h.name || '')) &&
+          isExactProductSpecMatch(query, String(h.name || '')),
+      )
       .map((h) => {
         const titleScore = scoreTitleMatch(qTokens, h.name || '');
         const uniqueMerchants = new Set(
@@ -3943,6 +4419,7 @@ async function fetchLiveKabumSearchOffer(
       );
       const relevance = scoreTitleMatch(qTokens, title);
       if (qTokens.length >= 2 && relevance < 0.45) continue;
+      if (!isExactProductSpecMatch(query, title)) continue;
 
       const discountPercent =
         regularPrice > pixPrice * 1.02
@@ -4002,15 +4479,18 @@ async function fetchLiveAmazonSearchOffer(
     if (!resp.ok) return null;
 
     const html = await resp.text();
-    const cards = html.split('data-component-type="s-search-result"').slice(1, 22);
+    const cards = html.split(/(?=<div[^>]+data-component-type="s-search-result")/i).slice(1, 24);
     const qTokens = normalizeSearchTokens(query);
     const parseBrl = (raw: string) => Number(raw.replace(/\./g, '').replace(',', '.'));
 
     let best: {candidate: StoreLivePriceCandidate; relevance: number} | null = null;
     for (const card of cards) {
-      const asinMatch = card.match(/\/dp\/([A-Z0-9]{10})/);
-      if (!asinMatch) continue;
-      const asin = asinMatch[1];
+      const dataAsinMatch = card.match(/data-asin="([A-Z0-9]{10})"/i);
+      const h2LinkAsinMatch = card.match(
+        /href="[^"]*\/dp\/([A-Z0-9]{10})[^"]*"[^>]*>\s*(?:<span[^>]*>)?\s*<h2/i,
+      );
+      const asin = (h2LinkAsinMatch?.[1] || dataAsinMatch?.[1] || '').toUpperCase();
+      if (!asin) continue;
 
       const titleMatch = card.match(/<h2[^>]*aria-label="([^"]+)"/);
       if (!titleMatch) continue;
@@ -4037,6 +4517,7 @@ async function fetchLiveAmazonSearchOffer(
 
       const relevance = scoreTitleMatch(qTokens, rawTitle);
       if (qTokens.length >= 2 && relevance < 0.45) continue;
+      if (!isExactProductSpecMatch(query, rawTitle)) continue;
 
       const imageUrl = card.match(/https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+/)?.[0] || '';
       const discountPercent =
